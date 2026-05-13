@@ -1,0 +1,10 @@
+*.exe
+*.dll
+*.syso
+*.partial
+*.log
+*.out
+*.test
+coverage.out
+bin/
+dist/
