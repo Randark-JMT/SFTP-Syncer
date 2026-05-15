@@ -97,7 +97,7 @@ func (s *Service) RunOnce(ctx context.Context, cfg config.Config) (Result, error
 
 	walker := client.Walk(remoteRoot)
 	var result Result
-	pendingDownloads := make([]pendingDownload, 0)
+	var pendingDownloads []pendingDownload
 	for walker.Step() {
 		if err := ctx.Err(); err != nil {
 			return result, err
@@ -195,7 +195,7 @@ func (s *Service) processDownloads(ctx context.Context, conn *ssh.Client, primar
 
 	s.logf("本轮待下载 %d 个文件，启用 %d 条下载通道。", len(downloads), len(clients))
 
-	tasks := make(chan pendingDownload)
+	tasks := make(chan pendingDownload, len(clients))
 	outcomes := make(chan downloadOutcome, len(downloads))
 
 	var wg sync.WaitGroup
@@ -236,10 +236,11 @@ func (s *Service) processDownloads(ctx context.Context, conn *ssh.Client, primar
 	go func() {
 		defer close(tasks)
 		for _, task := range downloads {
-			if ctx.Err() != nil {
+			select {
+			case <-ctx.Done():
 				return
+			case tasks <- task:
 			}
-			tasks <- task
 		}
 	}()
 

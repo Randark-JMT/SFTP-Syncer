@@ -508,9 +508,7 @@ func (aw *appWindow) setStatus(text string) {
 		return
 	}
 	aw.Synchronize(func() {
-		if aw.statusLabel != nil {
-			_ = aw.statusLabel.SetText(text)
-		}
+		_ = aw.statusLabel.SetText(text)
 	})
 }
 
