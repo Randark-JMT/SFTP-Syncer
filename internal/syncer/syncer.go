@@ -372,6 +372,16 @@ func (s *Service) hostKeyCallback(cfg config.Config) (ssh.HostKeyCallback, error
 }
 
 func (s *Service) downloadFile(ctx context.Context, client *sftp.Client, remotePath, localPath string, info os.FileInfo) error {
+	err := s.downloadFileOnce(ctx, client, remotePath, localPath, info, true)
+	if err == nil || errors.Is(err, context.Canceled) {
+		return err
+	}
+
+	s.logf("高速下载失败，改用兼容模式重试（%s）: %v", remotePath, err)
+	return s.downloadFileOnce(ctx, client, remotePath, localPath, info, false)
+}
+
+func (s *Service) downloadFileOnce(ctx context.Context, client *sftp.Client, remotePath, localPath string, info os.FileInfo, allowWriterTo bool) error {
 	remoteFile, err := client.Open(remotePath)
 	if err != nil {
 		return err
@@ -385,9 +395,13 @@ func (s *Service) downloadFile(ctx context.Context, client *sftp.Client, remoteP
 	if err != nil {
 		return err
 	}
-	s.logf("开始下载: %s -> %s (%d 字节)", remotePath, localPath, info.Size())
+	modeName := "高速模式"
+	if !allowWriterTo {
+		modeName = "兼容模式"
+	}
+	s.logf("开始下载（%s）: %s -> %s (%d 字节)", modeName, remotePath, localPath, info.Size())
 
-	copied, copyErr := copyWithContext(ctx, localFile, remoteFile)
+	copied, copyErr := copyWithContextMode(ctx, localFile, remoteFile, allowWriterTo)
 	closeErr := localFile.Close()
 	if copyErr != nil {
 		_ = os.Remove(tempPath)
@@ -401,7 +415,7 @@ func (s *Service) downloadFile(ctx context.Context, client *sftp.Client, remoteP
 		_ = os.Remove(tempPath)
 		return fmt.Errorf("下载字节数不匹配，期望 %d，实际 %d", info.Size(), copied)
 	}
-	s.logf("下载完成: %s (%d 字节)", remotePath, copied)
+	s.logf("下载完成（%s）: %s (%d 字节)", modeName, remotePath, copied)
 
 	if err := os.Remove(localPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		_ = os.Remove(tempPath)
@@ -421,29 +435,35 @@ func (s *Service) downloadFile(ctx context.Context, client *sftp.Client, remoteP
 }
 
 func copyWithContext(ctx context.Context, dst io.Writer, src io.Reader) (int64, error) {
+	return copyWithContextMode(ctx, dst, src, true)
+}
+
+func copyWithContextMode(ctx context.Context, dst io.Writer, src io.Reader, allowWriterTo bool) (int64, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
 
-	if writerTo, ok := src.(io.WriterTo); ok {
-		var stop func() bool
-		if closer, ok := src.(io.Closer); ok {
-			stop = context.AfterFunc(ctx, func() {
-				_ = closer.Close()
-			})
-		}
-		if stop != nil {
-			defer stop()
-		}
-
-		written, err := writerTo.WriteTo(dst)
-		if err != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return written, ctxErr
+	if allowWriterTo {
+		if writerTo, ok := src.(io.WriterTo); ok {
+			var stop func() bool
+			if closer, ok := src.(io.Closer); ok {
+				stop = context.AfterFunc(ctx, func() {
+					_ = closer.Close()
+				})
 			}
-			return written, err
+			if stop != nil {
+				defer stop()
+			}
+
+			written, err := writerTo.WriteTo(dst)
+			if err != nil {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return written, ctxErr
+				}
+				return written, err
+			}
+			return written, nil
 		}
-		return written, nil
 	}
 
 	buf := make([]byte, 32*1024)

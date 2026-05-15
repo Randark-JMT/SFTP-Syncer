@@ -88,6 +88,25 @@ func TestCopyWithContextUsesWriterTo(t *testing.T) {
 	}
 }
 
+func TestCopyWithContextModeCanBypassWriterTo(t *testing.T) {
+	reader := &writerToProbe{data: []byte("compat mode")}
+	var dst bytes.Buffer
+
+	written, err := copyWithContextMode(context.Background(), &dst, reader, false)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if reader.usedWriterTo {
+		t.Fatal("expected WriterTo path to be bypassed")
+	}
+	if int(written) != len(reader.data) {
+		t.Fatalf("expected %d bytes written, got %d", len(reader.data), written)
+	}
+	if dst.String() != string(reader.data) {
+		t.Fatalf("expected %q, got %q", string(reader.data), dst.String())
+	}
+}
+
 func TestCopyWithContextReturnsErrNoProgress(t *testing.T) {
 	_, err := copyWithContext(context.Background(), io.Discard, zeroProgressReader{})
 	if !errors.Is(err, io.ErrNoProgress) {
