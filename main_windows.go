@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -64,13 +65,16 @@ type fileTaskEntry struct {
 // fileTaskModel is a walk TableModel that shows per-file download progress.
 type fileTaskModel struct {
 	walk.TableModelBase
-	mu    sync.Mutex
-	items []*fileTaskEntry
-	index map[string]int // remotePath → items index
+	sortChangedPublisher walk.EventPublisher
+	mu                   sync.Mutex
+	items                []*fileTaskEntry
+	index                map[string]int // remotePath → items index
+	sortCol              int
+	sortOrder            walk.SortOrder
 }
 
 func newFileTaskModel() *fileTaskModel {
-	return &fileTaskModel{index: make(map[string]int)}
+	return &fileTaskModel{index: make(map[string]int), sortCol: -1}
 }
 
 func (m *fileTaskModel) RowCount() int {
@@ -115,13 +119,89 @@ func (m *fileTaskModel) clear() {
 	m.index = make(map[string]int)
 }
 
+func (m *fileTaskModel) ColumnSortable(_ int) bool { return true }
+
+func (m *fileTaskModel) SortChanged() *walk.Event { return m.sortChangedPublisher.Event() }
+
+func (m *fileTaskModel) SortedColumn() int { return m.sortCol }
+
+func (m *fileTaskModel) SortOrder() walk.SortOrder { return m.sortOrder }
+
+func (m *fileTaskModel) Sort(col int, order walk.SortOrder) error {
+	m.mu.Lock()
+	m.sortCol = col
+	m.sortOrder = order
+	m.sortItems()
+	m.rebuildIndex()
+	m.mu.Unlock()
+	m.sortChangedPublisher.Publish()
+	return nil
+}
+
+// sortItems re-sorts m.items in place. Must be called with m.mu held.
+func (m *fileTaskModel) sortItems() {
+	if m.sortCol < 0 || len(m.items) == 0 {
+		return
+	}
+	col := m.sortCol
+	asc := m.sortOrder == walk.SortAscending
+	sort.SliceStable(m.items, func(i, j int) bool {
+		a, b := m.items[i], m.items[j]
+		var less bool
+		switch col {
+		case 0:
+			less = a.state < b.state
+		case 1:
+			less = a.remotePath < b.remotePath
+		case 2:
+			less = a.totalBytes < b.totalBytes
+		case 3:
+			var pa, pb int64
+			if a.totalBytes > 0 {
+				pa = 100 * a.downloaded / a.totalBytes
+			}
+			if b.totalBytes > 0 {
+				pb = 100 * b.downloaded / b.totalBytes
+			}
+			less = pa < pb
+		case 4:
+			less = a.speedBps < b.speedBps
+		}
+		if asc {
+			return less
+		}
+		return !less
+	})
+}
+
+// rebuildIndex rebuilds the remotePath → index map. Must be called with m.mu held.
+func (m *fileTaskModel) rebuildIndex() {
+	m.index = make(map[string]int, len(m.items))
+	for i, item := range m.items {
+		m.index[item.remotePath] = i
+	}
+}
+
 // updateEntry updates an existing entry or inserts a new one.
-// Returns the row index of the changed row, or -1 if a new row was appended.
+// Completed (Done) entries are removed from the list.
+// Returns the row index of the changed row, or -1 if a full reset is needed.
 func (m *fileTaskModel) updateEntry(evt syncer.ProgressEvent) int {
 	stateStr := progressStateLabel(evt.State)
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
 	if idx, ok := m.index[evt.RemotePath]; ok {
+		if evt.State == syncer.ProgressStateDone {
+			// Remove completed task from the list.
+			m.items = append(m.items[:idx], m.items[idx+1:]...)
+			delete(m.index, evt.RemotePath)
+			for path, i := range m.index {
+				if i > idx {
+					m.index[path] = i - 1
+				}
+			}
+			return -1
+		}
 		item := m.items[idx]
 		item.state = stateStr
 		if evt.Downloaded > 0 {
@@ -133,11 +213,22 @@ func (m *fileTaskModel) updateEntry(evt syncer.ProgressEvent) int {
 		if evt.SpeedBps > 0 {
 			item.speedBps = evt.SpeedBps
 		}
-		if evt.State == syncer.ProgressStateDone || evt.State == syncer.ProgressStateFailed {
+		if evt.State == syncer.ProgressStateFailed {
 			item.speedBps = 0
+		}
+		if m.sortCol >= 0 {
+			m.sortItems()
+			m.rebuildIndex()
+			return -1
 		}
 		return idx
 	}
+
+	// Ignore Done events for entries not in the list.
+	if evt.State == syncer.ProgressStateDone {
+		return -1
+	}
+
 	entry := &fileTaskEntry{
 		remotePath: evt.RemotePath,
 		totalBytes: evt.Total,
@@ -145,8 +236,12 @@ func (m *fileTaskModel) updateEntry(evt syncer.ProgressEvent) int {
 		speedBps:   evt.SpeedBps,
 		state:      stateStr,
 	}
-	m.index[evt.RemotePath] = len(m.items)
 	m.items = append(m.items, entry)
+	m.index[evt.RemotePath] = len(m.items) - 1
+	if m.sortCol >= 0 {
+		m.sortItems()
+		m.rebuildIndex()
+	}
 	return -1
 }
 
