@@ -52,15 +52,49 @@ type downloadOutcome struct {
 	deleted    bool
 }
 
+// ProgressState is the lifecycle state of a single file download task.
+type ProgressState string
+
+const (
+	ProgressStatePending ProgressState = "pending"
+	ProgressStateActive  ProgressState = "active"
+	ProgressStateDone    ProgressState = "done"
+	ProgressStateFailed  ProgressState = "failed"
+)
+
+// ProgressEvent carries per-file progress information to the caller.
+type ProgressEvent struct {
+	RemotePath string
+	State      ProgressState
+	Downloaded int64
+	Total      int64
+	SpeedBps   float64
+}
+
+// ProgressCallback is invoked with progress updates during downloads.
+type ProgressCallback func(ProgressEvent)
+
 type Service struct {
-	logger Logger
-	now    func() time.Time
+	logger     Logger
+	now        func() time.Time
+	onProgress ProgressCallback
 }
 
 func NewService(logger Logger) *Service {
 	return &Service{
 		logger: logger,
 		now:    time.Now,
+	}
+}
+
+// SetProgressCallback registers a callback for per-file download progress updates.
+func (s *Service) SetProgressCallback(cb ProgressCallback) {
+	s.onProgress = cb
+}
+
+func (s *Service) notifyProgress(evt ProgressEvent) {
+	if s.onProgress != nil {
+		s.onProgress(evt)
 	}
 }
 
@@ -166,7 +200,7 @@ func (s *Service) RunOnce(ctx context.Context, cfg config.Config) (Result, error
 		return result, fmt.Errorf("远程遍历结束时出错: %w", err)
 	}
 
-	downloaded, deleted, err := s.processDownloads(ctx, conn, client, pendingDownloads)
+	downloaded, deleted, err := s.processDownloads(ctx, sshConfig, addr, pendingDownloads)
 	result.Downloaded += downloaded
 	result.Deleted += deleted
 	if err != nil {
@@ -185,15 +219,28 @@ func (s *Service) newSFTPClient(conn *ssh.Client) (*sftp.Client, error) {
 	)
 }
 
-func (s *Service) processDownloads(ctx context.Context, conn *ssh.Client, primaryClient *sftp.Client, downloads []pendingDownload) (int, int, error) {
+func (s *Service) processDownloads(ctx context.Context, sshConfig *ssh.ClientConfig, addr string, downloads []pendingDownload) (int, int, error) {
 	if len(downloads) == 0 {
 		return 0, 0, nil
 	}
 
-	clients, cleanup := s.downloadClients(conn, primaryClient, len(downloads))
+	// Announce all pending tasks before starting any workers.
+	for _, dl := range downloads {
+		s.notifyProgress(ProgressEvent{
+			RemotePath: dl.remotePath,
+			State:      ProgressStatePending,
+			Total:      dl.info.Size(),
+		})
+	}
+
+	clients, cleanup := s.downloadClients(sshConfig, addr, len(downloads))
 	defer cleanup()
 
-	s.logf("本轮待下载 %d 个文件，启用 %d 条下载通道。", len(downloads), len(clients))
+	if len(clients) == 0 {
+		return 0, 0, fmt.Errorf("无法创建任何独立下载会话")
+	}
+
+	s.logf("本轮待下载 %d 个文件，启用 %d 条独立 SFTP 会话。", len(downloads), len(clients))
 
 	tasks := make(chan pendingDownload, len(clients))
 	outcomes := make(chan downloadOutcome, len(downloads))
@@ -211,22 +258,50 @@ func (s *Service) processDownloads(ctx context.Context, conn *ssh.Client, primar
 
 				if err := os.MkdirAll(filepath.Dir(task.localPath), 0o755); err != nil {
 					s.logf("创建本地目录失败（%s）: %v", task.localPath, err)
+					s.notifyProgress(ProgressEvent{
+						RemotePath: task.remotePath,
+						State:      ProgressStateFailed,
+						Total:      task.info.Size(),
+					})
 					continue
 				}
 
+				s.notifyProgress(ProgressEvent{
+					RemotePath: task.remotePath,
+					State:      ProgressStateActive,
+					Total:      task.info.Size(),
+				})
+
 				if err := s.downloadFile(ctx, client, task.remotePath, task.localPath, task.info); err != nil {
+					s.notifyProgress(ProgressEvent{
+						RemotePath: task.remotePath,
+						State:      ProgressStateFailed,
+						Total:      task.info.Size(),
+					})
 					s.logf("下载失败（%s）: %v", task.remotePath, err)
 					continue
 				}
 
 				outcome := downloadOutcome{downloaded: true}
 				if err := client.Remove(task.remotePath); err != nil {
+					s.notifyProgress(ProgressEvent{
+						RemotePath: task.remotePath,
+						State:      ProgressStateDone,
+						Downloaded: task.info.Size(),
+						Total:      task.info.Size(),
+					})
 					s.logf("下载完成，但删除远程文件失败（%s）: %v", task.remotePath, err)
 					outcomes <- outcome
 					continue
 				}
 
 				outcome.deleted = true
+				s.notifyProgress(ProgressEvent{
+					RemotePath: task.remotePath,
+					State:      ProgressStateDone,
+					Downloaded: task.info.Size(),
+					Total:      task.info.Size(),
+				})
 				s.logf("已同步并删除远程文件: %s -> %s", task.remotePath, task.localPath)
 				outcomes <- outcome
 			}
@@ -267,28 +342,40 @@ func (s *Service) processDownloads(ctx context.Context, conn *ssh.Client, primar
 	return downloaded, deleted, nil
 }
 
-func (s *Service) downloadClients(conn *ssh.Client, primaryClient *sftp.Client, taskCount int) ([]*sftp.Client, func()) {
-	clients := []*sftp.Client{primaryClient}
+func (s *Service) downloadClients(sshConfig *ssh.ClientConfig, addr string, taskCount int) ([]*sftp.Client, func()) {
 	workerCount := downloadWorkerCount(taskCount)
-	if workerCount <= 1 {
-		return clients, func() {}
+	if workerCount == 0 {
+		return nil, func() {}
 	}
 
-	extras := make([]*sftp.Client, 0, workerCount-1)
-	for i := 1; i < workerCount; i++ {
-		client, err := s.newSFTPClient(conn)
+	type sshSFTPPair struct {
+		conn   *ssh.Client
+		client *sftp.Client
+	}
+
+	pairs := make([]sshSFTPPair, 0, workerCount)
+	clients := make([]*sftp.Client, 0, workerCount)
+
+	for i := 0; i < workerCount; i++ {
+		conn, err := ssh.Dial("tcp", addr, sshConfig)
 		if err != nil {
-			s.logf("创建额外下载通道失败，降级为 %d 条下载通道: %v", len(clients), err)
+			s.logf("创建独立下载 SSH 连接失败，降级为 %d 条会话: %v", len(clients), err)
 			break
 		}
-
+		client, err := s.newSFTPClient(conn)
+		if err != nil {
+			_ = conn.Close()
+			s.logf("创建独立下载 SFTP 客户端失败，降级为 %d 条会话: %v", len(clients), err)
+			break
+		}
+		pairs = append(pairs, sshSFTPPair{conn, client})
 		clients = append(clients, client)
-		extras = append(extras, client)
 	}
 
 	return clients, func() {
-		for _, client := range extras {
-			_ = client.Close()
+		for _, p := range pairs {
+			_ = p.client.Close()
+			_ = p.conn.Close()
 		}
 	}
 }
@@ -402,7 +489,21 @@ func (s *Service) downloadFileOnce(ctx context.Context, client *sftp.Client, rem
 	}
 	s.logf("开始下载（%s）: %s -> %s (%d 字节)", modeName, remotePath, localPath, info.Size())
 
-	copied, copyErr := copyWithContextMode(ctx, localFile, remoteFile, allowWriterTo)
+	pw := &progressWriter{
+		Writer:   localFile,
+		lastTime: time.Now(),
+		onUpdate: func(downloaded int64, speedBps float64) {
+			s.notifyProgress(ProgressEvent{
+				RemotePath: remotePath,
+				State:      ProgressStateActive,
+				Downloaded: downloaded,
+				Total:      info.Size(),
+				SpeedBps:   speedBps,
+			})
+		},
+	}
+
+	copied, copyErr := copyWithContextMode(ctx, pw, remoteFile, allowWriterTo)
 	closeErr := localFile.Close()
 	if copyErr != nil {
 		_ = os.Remove(tempPath)
@@ -504,6 +605,29 @@ func copyWithContextMode(ctx context.Context, dst io.Writer, src io.Reader, allo
 			return written, er
 		}
 	}
+}
+
+// progressWriter wraps an io.Writer and calls onUpdate with byte count and speed
+// at most once every 250 ms so callers are not flooded with callbacks.
+type progressWriter struct {
+	io.Writer
+	downloaded int64
+	lastBytes  int64
+	lastTime   time.Time
+	onUpdate   func(downloaded int64, speedBps float64)
+}
+
+func (pw *progressWriter) Write(p []byte) (int, error) {
+	n, err := pw.Writer.Write(p)
+	pw.downloaded += int64(n)
+	now := time.Now()
+	if elapsed := now.Sub(pw.lastTime); elapsed >= 250*time.Millisecond {
+		delta := pw.downloaded - pw.lastBytes
+		pw.onUpdate(pw.downloaded, float64(delta)/elapsed.Seconds())
+		pw.lastBytes = pw.downloaded
+		pw.lastTime = now
+	}
+	return n, err
 }
 
 func eligibleForTransfer(modTimeUTC, nowUTC time.Time, quietPeriod time.Duration) bool {

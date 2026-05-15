@@ -40,6 +40,8 @@ type appWindow struct {
 	saveButton               *walk.PushButton
 	statusLabel              *walk.Label
 	logView                  *walk.TextEdit
+	taskView                 *walk.TableView
+	taskModel                *fileTaskModel
 	tray                     *walk.NotifyIcon
 	trayHintShown            bool
 	logLines                 []string
@@ -48,6 +50,131 @@ type appWindow struct {
 	syncMu                   sync.Mutex
 	syncCancel               context.CancelFunc
 	syncRunning              bool
+}
+
+// fileTaskEntry holds the current download state for a single remote file.
+type fileTaskEntry struct {
+	remotePath string
+	totalBytes int64
+	downloaded int64
+	speedBps   float64
+	state      string
+}
+
+// fileTaskModel is a walk TableModel that shows per-file download progress.
+type fileTaskModel struct {
+	walk.TableModelBase
+	mu    sync.Mutex
+	items []*fileTaskEntry
+	index map[string]int // remotePath → items index
+}
+
+func newFileTaskModel() *fileTaskModel {
+	return &fileTaskModel{index: make(map[string]int)}
+}
+
+func (m *fileTaskModel) RowCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.items)
+}
+
+func (m *fileTaskModel) Value(row, col int) interface{} {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if row < 0 || row >= len(m.items) {
+		return ""
+	}
+	item := m.items[row]
+	switch col {
+	case 0:
+		return item.state
+	case 1:
+		return item.remotePath
+	case 2:
+		return formatFileSize(item.totalBytes)
+	case 3:
+		if item.totalBytes <= 0 {
+			return "—"
+		}
+		pct := int64(100) * item.downloaded / item.totalBytes
+		return fmt.Sprintf("%s / %s (%d%%)", formatFileSize(item.downloaded), formatFileSize(item.totalBytes), pct)
+	case 4:
+		if item.speedBps < 1 {
+			return "—"
+		}
+		return formatFileSize(int64(item.speedBps)) + "/s"
+	}
+	return ""
+}
+
+func (m *fileTaskModel) clear() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.items = nil
+	m.index = make(map[string]int)
+}
+
+// updateEntry updates an existing entry or inserts a new one.
+// Returns the row index of the changed row, or -1 if a new row was appended.
+func (m *fileTaskModel) updateEntry(evt syncer.ProgressEvent) int {
+	stateStr := progressStateLabel(evt.State)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if idx, ok := m.index[evt.RemotePath]; ok {
+		item := m.items[idx]
+		item.state = stateStr
+		if evt.Downloaded > 0 {
+			item.downloaded = evt.Downloaded
+		}
+		if evt.Total > 0 {
+			item.totalBytes = evt.Total
+		}
+		if evt.SpeedBps > 0 {
+			item.speedBps = evt.SpeedBps
+		}
+		if evt.State == syncer.ProgressStateDone || evt.State == syncer.ProgressStateFailed {
+			item.speedBps = 0
+		}
+		return idx
+	}
+	entry := &fileTaskEntry{
+		remotePath: evt.RemotePath,
+		totalBytes: evt.Total,
+		downloaded: evt.Downloaded,
+		speedBps:   evt.SpeedBps,
+		state:      stateStr,
+	}
+	m.index[evt.RemotePath] = len(m.items)
+	m.items = append(m.items, entry)
+	return -1
+}
+
+func progressStateLabel(state syncer.ProgressState) string {
+	switch state {
+	case syncer.ProgressStatePending:
+		return "待执行"
+	case syncer.ProgressStateActive:
+		return "下载中"
+	case syncer.ProgressStateDone:
+		return "已完成"
+	case syncer.ProgressStateFailed:
+		return "失败"
+	}
+	return string(state)
+}
+
+func formatFileSize(bytes int64) string {
+	switch {
+	case bytes < 1024:
+		return fmt.Sprintf("%d B", bytes)
+	case bytes < 1024*1024:
+		return fmt.Sprintf("%.1f KB", float64(bytes)/1024)
+	case bytes < 1024*1024*1024:
+		return fmt.Sprintf("%.1f MB", float64(bytes)/(1024*1024))
+	default:
+		return fmt.Sprintf("%.2f GB", float64(bytes)/(1024*1024*1024))
+	}
 }
 
 func main() {
@@ -79,7 +206,9 @@ func showStartupError(err error) {
 }
 
 func newAppWindow() (*appWindow, error) {
-	aw := &appWindow{}
+	aw := &appWindow{
+		taskModel: newFileTaskModel(),
+	}
 	if err := aw.buildUI(); err != nil {
 		return nil, err
 	}
@@ -98,8 +227,8 @@ func (aw *appWindow) buildUI() error {
 		AssignTo: &aw.MainWindow,
 		Name:     "SFTPSyncerMainWindow",
 		Title:    "SFTP Syncer",
-		MinSize:  Size{Width: 820, Height: 760},
-		Size:     Size{Width: 920, Height: 820},
+		MinSize:  Size{Width: 820, Height: 800},
+		Size:     Size{Width: 920, Height: 900},
 		Layout:   VBox{},
 		Children: []Widget{
 			Composite{
@@ -172,7 +301,36 @@ func (aw *appWindow) buildUI() error {
 			},
 			Label{AssignTo: &aw.statusLabel, Text: "状态：就绪"},
 			Label{Text: "同步规则：仅处理远程根目录下各子文件夹中的常规文件；根目录下的脚本、配置和其他散文件会被跳过。仅同步 UTC 修改时间早于当前时间 30 分钟的文件，下载后保留目录结构并删除远程源文件。"},
-			TextEdit{AssignTo: &aw.logView, ReadOnly: true, VScroll: true, StretchFactor: 1},
+			VSplitter{
+				StretchFactor: 1,
+				Children: []Widget{
+					Composite{
+						Layout: VBox{MarginsZero: true},
+						Children: []Widget{
+							Label{Text: "当前任务"},
+							TableView{
+								AssignTo:            &aw.taskView,
+								Model:               aw.taskModel,
+								LastColumnStretched: true,
+								Columns: []TableViewColumn{
+									{Title: "状态", Width: 60},
+									{Title: "路径", Width: 360},
+									{Title: "大小", Width: 80},
+									{Title: "进度", Width: 170},
+									{Title: "速度", Width: 90},
+								},
+							},
+						},
+					},
+					Composite{
+						Layout: VBox{MarginsZero: true},
+						Children: []Widget{
+							Label{Text: "日志"},
+							TextEdit{AssignTo: &aw.logView, ReadOnly: true, VScroll: true},
+						},
+					},
+				},
+			},
 		},
 		OnSizeChanged: aw.handleSizeChanged,
 	}).Create()
@@ -399,6 +557,7 @@ func (aw *appWindow) runSyncLoop(ctx context.Context, cfg config.Config) {
 	service := syncer.NewService(func(format string, args ...any) {
 		aw.appendLog(fmt.Sprintf(format, args...))
 	})
+	service.SetProgressCallback(aw.handleProgress)
 	interval := time.Duration(cfg.PollIntervalSeconds) * time.Second
 
 	defer func() {
@@ -421,6 +580,11 @@ func (aw *appWindow) runSyncLoop(ctx context.Context, cfg config.Config) {
 		if ctx.Err() != nil {
 			aw.appendLog("同步循环已停止。")
 			return
+		}
+
+		aw.taskModel.clear()
+		if aw.MainWindow != nil && !aw.IsDisposed() {
+			aw.Synchronize(func() { aw.taskModel.PublishRowsReset() })
 		}
 
 		result, err := service.RunOnce(ctx, cfg)
@@ -509,6 +673,20 @@ func (aw *appWindow) setStatus(text string) {
 	}
 	aw.Synchronize(func() {
 		_ = aw.statusLabel.SetText(text)
+	})
+}
+
+func (aw *appWindow) handleProgress(evt syncer.ProgressEvent) {
+	row := aw.taskModel.updateEntry(evt)
+	if aw.MainWindow == nil || aw.IsDisposed() {
+		return
+	}
+	aw.Synchronize(func() {
+		if row < 0 {
+			aw.taskModel.PublishRowsReset()
+		} else {
+			aw.taskModel.PublishRowChanged(row)
+		}
 	})
 }
 
