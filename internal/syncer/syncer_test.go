@@ -88,25 +88,6 @@ func TestCopyWithContextUsesWriterTo(t *testing.T) {
 	}
 }
 
-func TestCopyWithContextModeCanBypassWriterTo(t *testing.T) {
-	reader := &writerToProbe{data: []byte("compat mode")}
-	var dst bytes.Buffer
-
-	written, err := copyWithContextMode(context.Background(), &dst, reader, false)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if reader.usedWriterTo {
-		t.Fatal("expected WriterTo path to be bypassed")
-	}
-	if int(written) != len(reader.data) {
-		t.Fatalf("expected %d bytes written, got %d", len(reader.data), written)
-	}
-	if dst.String() != string(reader.data) {
-		t.Fatalf("expected %q, got %q", string(reader.data), dst.String())
-	}
-}
-
 func TestCopyWithContextReturnsErrNoProgress(t *testing.T) {
 	_, err := copyWithContext(context.Background(), io.Discard, zeroProgressReader{})
 	if !errors.Is(err, io.ErrNoProgress) {
@@ -133,28 +114,6 @@ func TestCopyWithContextCancelsWriterToReader(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("copyWithContext did not stop after cancellation")
-	}
-}
-
-func TestDownloadWorkerCount(t *testing.T) {
-	tests := []struct {
-		name      string
-		taskCount int
-		want      int
-	}{
-		{name: "no tasks", taskCount: 0, want: 0},
-		{name: "single task", taskCount: 1, want: 1},
-		{name: "below cap", taskCount: 3, want: 3},
-		{name: "at cap", taskCount: maxDownloadWorkers, want: maxDownloadWorkers},
-		{name: "above cap", taskCount: maxDownloadWorkers + 5, want: maxDownloadWorkers},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := downloadWorkerCount(tt.taskCount); got != tt.want {
-				t.Fatalf("expected %d, got %d", tt.want, got)
-			}
-		})
 	}
 }
 

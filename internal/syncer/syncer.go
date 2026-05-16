@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -25,8 +24,8 @@ import (
 const QuietPeriod = 30 * time.Minute
 
 const (
-	maxDownloadWorkers           = 4
-	maxConcurrentRequestsPerFile = 128
+	maxDownloadWorkers = 4
+	workerCooldown     = 10 * time.Second
 )
 
 type Logger func(format string, args ...any)
@@ -50,6 +49,29 @@ type pendingDownload struct {
 type downloadOutcome struct {
 	downloaded bool
 	deleted    bool
+}
+
+// workerTask is a download job submitted to the persistent worker pool.
+type workerTask struct {
+	dl     pendingDownload
+	result chan<- downloadOutcome
+}
+
+// workerPool holds the shared task queue consumed by poolWorkers.
+type workerPool struct {
+	queue chan workerTask
+}
+
+// poolWorker is a persistent goroutine that owns one SSH+SFTP connection.
+// On any failure it disconnects and enters a cooldown before accepting new tasks.
+type poolWorker struct {
+	id        int
+	service   *Service
+	sshConfig *ssh.ClientConfig
+	addr      string
+	conn      *ssh.Client
+	client    *sftp.Client
+	coolUntil time.Time
 }
 
 // ProgressState is the lifecycle state of a single file download task.
@@ -78,6 +100,7 @@ type Service struct {
 	logger     Logger
 	now        func() time.Time
 	onProgress ProgressCallback
+	pool       *workerPool
 }
 
 func NewService(logger Logger) *Service {
@@ -110,6 +133,7 @@ func (s *Service) RunOnce(ctx context.Context, cfg config.Config) (Result, error
 	}
 
 	addr := net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
+	s.initPool(ctx, sshConfig, addr)
 	s.logf("连接到 %s ...", addr)
 	conn, err := ssh.Dial("tcp", addr, sshConfig)
 	if err != nil {
@@ -200,7 +224,7 @@ func (s *Service) RunOnce(ctx context.Context, cfg config.Config) (Result, error
 		return result, fmt.Errorf("远程遍历结束时出错: %w", err)
 	}
 
-	downloaded, deleted, err := s.processDownloads(ctx, sshConfig, addr, pendingDownloads)
+	downloaded, deleted, err := s.processDownloads(ctx, pendingDownloads)
 	result.Downloaded += downloaded
 	result.Deleted += deleted
 	if err != nil {
@@ -215,16 +239,14 @@ func (s *Service) newSFTPClient(conn *ssh.Client) (*sftp.Client, error) {
 		conn,
 		sftp.UseConcurrentReads(true),
 		sftp.UseFstat(true),
-		sftp.MaxConcurrentRequestsPerFile(maxConcurrentRequestsPerFile),
 	)
 }
 
-func (s *Service) processDownloads(ctx context.Context, sshConfig *ssh.ClientConfig, addr string, downloads []pendingDownload) (int, int, error) {
+func (s *Service) processDownloads(ctx context.Context, downloads []pendingDownload) (int, int, error) {
 	if len(downloads) == 0 {
 		return 0, 0, nil
 	}
 
-	// Announce all pending tasks before starting any workers.
 	for _, dl := range downloads {
 		s.notifyProgress(ProgressEvent{
 			RemotePath: dl.remotePath,
@@ -233,161 +255,168 @@ func (s *Service) processDownloads(ctx context.Context, sshConfig *ssh.ClientCon
 		})
 	}
 
-	clients, cleanup := s.downloadClients(sshConfig, addr, len(downloads))
-	defer cleanup()
+	s.logf("本轮待下载 %d 个文件，提交至 %d 个 Worker 队列。", len(downloads), maxDownloadWorkers)
 
-	if len(clients) == 0 {
-		return 0, 0, fmt.Errorf("无法创建任何独立下载会话")
+	resultCh := make(chan downloadOutcome, len(downloads))
+	for _, dl := range downloads {
+		select {
+		case <-ctx.Done():
+			return 0, 0, ctx.Err()
+		case s.pool.queue <- workerTask{dl: dl, result: resultCh}:
+		}
 	}
 
-	s.logf("本轮待下载 %d 个文件，启用 %d 条独立 SFTP 会话。", len(downloads), len(clients))
-
-	tasks := make(chan pendingDownload, len(clients))
-	outcomes := make(chan downloadOutcome, len(downloads))
-
-	var wg sync.WaitGroup
-	for _, workerClient := range clients {
-		wg.Add(1)
-		go func(client *sftp.Client) {
-			defer wg.Done()
-
-			for task := range tasks {
-				if err := ctx.Err(); err != nil {
-					return
-				}
-
-				if err := os.MkdirAll(filepath.Dir(task.localPath), 0o755); err != nil {
-					s.logf("创建本地目录失败（%s）: %v", task.localPath, err)
-					s.notifyProgress(ProgressEvent{
-						RemotePath: task.remotePath,
-						State:      ProgressStateFailed,
-						Total:      task.info.Size(),
-					})
-					continue
-				}
-
-				s.notifyProgress(ProgressEvent{
-					RemotePath: task.remotePath,
-					State:      ProgressStateActive,
-					Total:      task.info.Size(),
-				})
-
-				if err := s.downloadFile(ctx, client, task.remotePath, task.localPath, task.info); err != nil {
-					s.notifyProgress(ProgressEvent{
-						RemotePath: task.remotePath,
-						State:      ProgressStateFailed,
-						Total:      task.info.Size(),
-					})
-					s.logf("下载失败（%s）: %v", task.remotePath, err)
-					continue
-				}
-
-				outcome := downloadOutcome{downloaded: true}
-				if err := client.Remove(task.remotePath); err != nil {
-					s.notifyProgress(ProgressEvent{
-						RemotePath: task.remotePath,
-						State:      ProgressStateDone,
-						Downloaded: task.info.Size(),
-						Total:      task.info.Size(),
-					})
-					s.logf("下载完成，但删除远程文件失败（%s）: %v", task.remotePath, err)
-					outcomes <- outcome
-					continue
-				}
-
-				outcome.deleted = true
-				s.notifyProgress(ProgressEvent{
-					RemotePath: task.remotePath,
-					State:      ProgressStateDone,
-					Downloaded: task.info.Size(),
-					Total:      task.info.Size(),
-				})
-				s.logf("已同步并删除远程文件: %s -> %s", task.remotePath, task.localPath)
-				outcomes <- outcome
+	var downloaded, deleted int
+	for range downloads {
+		select {
+		case <-ctx.Done():
+			return downloaded, deleted, ctx.Err()
+		case outcome := <-resultCh:
+			if outcome.downloaded {
+				downloaded++
 			}
-		}(workerClient)
-	}
-
-	go func() {
-		defer close(tasks)
-		for _, task := range downloads {
-			select {
-			case <-ctx.Done():
-				return
-			case tasks <- task:
+			if outcome.deleted {
+				deleted++
 			}
 		}
-	}()
-
-	go func() {
-		wg.Wait()
-		close(outcomes)
-	}()
-
-	var downloaded int
-	var deleted int
-	for outcome := range outcomes {
-		if outcome.downloaded {
-			downloaded++
-		}
-		if outcome.deleted {
-			deleted++
-		}
-	}
-
-	if err := ctx.Err(); err != nil {
-		return downloaded, deleted, err
 	}
 
 	return downloaded, deleted, nil
 }
 
-func (s *Service) downloadClients(sshConfig *ssh.ClientConfig, addr string, taskCount int) ([]*sftp.Client, func()) {
-	workerCount := downloadWorkerCount(taskCount)
-	if workerCount == 0 {
-		return nil, func() {}
+// initPool initialises the persistent worker pool on the first call; subsequent
+// calls are no-ops. Workers are bound to ctx so they stop when sync is cancelled.
+func (s *Service) initPool(ctx context.Context, sshConfig *ssh.ClientConfig, addr string) {
+	if s.pool != nil {
+		return
 	}
-
-	type sshSFTPPair struct {
-		conn   *ssh.Client
-		client *sftp.Client
-	}
-
-	pairs := make([]sshSFTPPair, 0, workerCount)
-	clients := make([]*sftp.Client, 0, workerCount)
-
-	for i := 0; i < workerCount; i++ {
-		conn, err := ssh.Dial("tcp", addr, sshConfig)
-		if err != nil {
-			s.logf("创建独立下载 SSH 连接失败，降级为 %d 条会话: %v", len(clients), err)
-			break
+	queue := make(chan workerTask, maxDownloadWorkers*256)
+	s.pool = &workerPool{queue: queue}
+	for i := range maxDownloadWorkers {
+		w := &poolWorker{
+			id:        i,
+			service:   s,
+			sshConfig: sshConfig,
+			addr:      addr,
 		}
-		client, err := s.newSFTPClient(conn)
-		if err != nil {
-			_ = conn.Close()
-			s.logf("创建独立下载 SFTP 客户端失败，降级为 %d 条会话: %v", len(clients), err)
-			break
-		}
-		pairs = append(pairs, sshSFTPPair{conn, client})
-		clients = append(clients, client)
+		go w.run(ctx, queue)
 	}
+	s.logf("已启动 %d 个下载 Worker。", maxDownloadWorkers)
+}
 
-	return clients, func() {
-		for _, p := range pairs {
-			_ = p.client.Close()
-			_ = p.conn.Close()
+func (w *poolWorker) run(ctx context.Context, queue <-chan workerTask) {
+	defer w.disconnect()
+
+	for {
+		if delay := time.Until(w.coolUntil); delay > 0 {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(delay):
+				w.service.logf("Worker %d 冷却结束，恢复接收任务。", w.id+1)
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case task, ok := <-queue:
+			if !ok {
+				return
+			}
+			w.executeTask(ctx, task)
 		}
 	}
 }
 
-func downloadWorkerCount(taskCount int) int {
-	if taskCount <= 0 {
-		return 0
+func (w *poolWorker) connect() error {
+	if w.client != nil {
+		return nil
 	}
-	if taskCount < maxDownloadWorkers {
-		return taskCount
+	conn, err := ssh.Dial("tcp", w.addr, w.sshConfig)
+	if err != nil {
+		return fmt.Errorf("SSH 连接失败: %w", err)
 	}
-	return maxDownloadWorkers
+	client, err := w.service.newSFTPClient(conn)
+	if err != nil {
+		_ = conn.Close()
+		return fmt.Errorf("创建 SFTP 客户端失败: %w", err)
+	}
+	w.conn = conn
+	w.client = client
+	w.service.logf("Worker %d 已建立 SFTP 连接。", w.id+1)
+	return nil
+}
+
+func (w *poolWorker) disconnect() {
+	if w.client != nil {
+		_ = w.client.Close()
+		w.client = nil
+	}
+	if w.conn != nil {
+		_ = w.conn.Close()
+		w.conn = nil
+	}
+}
+
+func (w *poolWorker) enterCooldown() {
+	w.coolUntil = time.Now().Add(workerCooldown)
+	w.service.logf("Worker %d 进入 %v 冷却。", w.id+1, workerCooldown)
+	w.disconnect()
+}
+
+func (w *poolWorker) executeTask(ctx context.Context, task workerTask) {
+	dl := task.dl
+
+	if ctx.Err() != nil {
+		task.result <- downloadOutcome{}
+		return
+	}
+
+	if err := os.MkdirAll(filepath.Dir(dl.localPath), 0o755); err != nil {
+		w.service.logf("创建本地目录失败（%s）: %v", dl.localPath, err)
+		w.service.notifyProgress(ProgressEvent{RemotePath: dl.remotePath, State: ProgressStateFailed, Total: dl.info.Size()})
+		task.result <- downloadOutcome{}
+		return
+	}
+
+	w.service.notifyProgress(ProgressEvent{RemotePath: dl.remotePath, State: ProgressStateActive, Total: dl.info.Size()})
+
+	if err := w.connect(); err != nil {
+		w.service.logf("Worker %d 连接失败，进入冷却（%s）: %v", w.id+1, dl.remotePath, err)
+		w.service.notifyProgress(ProgressEvent{RemotePath: dl.remotePath, State: ProgressStateFailed, Total: dl.info.Size()})
+		w.enterCooldown()
+		task.result <- downloadOutcome{}
+		return
+	}
+
+	if err := w.service.downloadFile(ctx, w.client, dl.remotePath, dl.localPath, dl.info); err != nil {
+		if errors.Is(err, context.Canceled) {
+			task.result <- downloadOutcome{}
+			return
+		}
+		w.service.logf("Worker %d 下载失败，进入冷却（%s）: %v", w.id+1, dl.remotePath, err)
+		w.service.notifyProgress(ProgressEvent{RemotePath: dl.remotePath, State: ProgressStateFailed, Total: dl.info.Size()})
+		w.enterCooldown()
+		task.result <- downloadOutcome{}
+		return
+	}
+
+	outcome := downloadOutcome{downloaded: true}
+	if err := w.client.Remove(dl.remotePath); err != nil {
+		w.service.logf("下载完成，但删除远程文件失败（%s）: %v", dl.remotePath, err)
+	} else {
+		outcome.deleted = true
+		w.service.logf("已同步并删除远程文件: %s -> %s", dl.remotePath, dl.localPath)
+	}
+
+	w.service.notifyProgress(ProgressEvent{
+		RemotePath: dl.remotePath,
+		State:      ProgressStateDone,
+		Downloaded: dl.info.Size(),
+		Total:      dl.info.Size(),
+	})
+	task.result <- outcome
 }
 
 func (s *Service) buildSSHConfig(cfg config.Config) (*ssh.ClientConfig, error) {
@@ -460,16 +489,6 @@ func (s *Service) hostKeyCallback(cfg config.Config) (ssh.HostKeyCallback, error
 }
 
 func (s *Service) downloadFile(ctx context.Context, client *sftp.Client, remotePath, localPath string, info os.FileInfo) error {
-	err := s.downloadFileOnce(ctx, client, remotePath, localPath, info, true)
-	if err == nil || errors.Is(err, context.Canceled) {
-		return err
-	}
-
-	s.logf("高速下载失败，改用兼容模式重试（%s）: %v", remotePath, err)
-	return s.downloadFileOnce(ctx, client, remotePath, localPath, info, false)
-}
-
-func (s *Service) downloadFileOnce(ctx context.Context, client *sftp.Client, remotePath, localPath string, info os.FileInfo, allowWriterTo bool) error {
 	remoteFile, err := client.Open(remotePath)
 	if err != nil {
 		return err
@@ -483,11 +502,7 @@ func (s *Service) downloadFileOnce(ctx context.Context, client *sftp.Client, rem
 	if err != nil {
 		return err
 	}
-	modeName := "高速模式"
-	if !allowWriterTo {
-		modeName = "兼容模式"
-	}
-	s.logf("开始下载（%s）: %s -> %s (%d 字节)", modeName, remotePath, localPath, info.Size())
+	s.logf("开始下载: %s -> %s (%d 字节)", remotePath, localPath, info.Size())
 
 	pw := &progressWriter{
 		Writer:   localFile,
@@ -503,7 +518,7 @@ func (s *Service) downloadFileOnce(ctx context.Context, client *sftp.Client, rem
 		},
 	}
 
-	copied, copyErr := copyWithContextMode(ctx, pw, remoteFile, allowWriterTo)
+	copied, copyErr := copyWithContext(ctx, pw, remoteFile)
 	closeErr := localFile.Close()
 	if copyErr != nil {
 		_ = os.Remove(tempPath)
@@ -517,7 +532,7 @@ func (s *Service) downloadFileOnce(ctx context.Context, client *sftp.Client, rem
 		_ = os.Remove(tempPath)
 		return fmt.Errorf("下载字节数不匹配，期望 %d，实际 %d", info.Size(), copied)
 	}
-	s.logf("下载完成（%s）: %s (%d 字节)", modeName, remotePath, copied)
+	s.logf("下载完成: %s (%d 字节)", remotePath, copied)
 
 	if err := os.Remove(localPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		_ = os.Remove(tempPath)
@@ -536,36 +551,32 @@ func (s *Service) downloadFileOnce(ctx context.Context, client *sftp.Client, rem
 	return nil
 }
 
+// copyWithContext copies src → dst, preferring the WriterTo fast path when
+// available (used by sftp.File for pipelined reads). Falls back to a buffered
+// Read loop for any reader that does not implement WriterTo.
 func copyWithContext(ctx context.Context, dst io.Writer, src io.Reader) (int64, error) {
-	return copyWithContextMode(ctx, dst, src, true)
-}
-
-func copyWithContextMode(ctx context.Context, dst io.Writer, src io.Reader, allowWriterTo bool) (int64, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
 
-	if allowWriterTo {
-		if writerTo, ok := src.(io.WriterTo); ok {
-			var stop func() bool
-			if closer, ok := src.(io.Closer); ok {
-				stop = context.AfterFunc(ctx, func() {
-					_ = closer.Close()
-				})
-			}
-			if stop != nil {
-				defer stop()
-			}
-
-			written, err := writerTo.WriteTo(dst)
-			if err != nil {
-				if ctxErr := ctx.Err(); ctxErr != nil {
-					return written, ctxErr
-				}
-				return written, err
-			}
-			return written, nil
+	if writerTo, ok := src.(io.WriterTo); ok {
+		var stop func() bool
+		if closer, ok := src.(io.Closer); ok {
+			stop = context.AfterFunc(ctx, func() {
+				_ = closer.Close()
+			})
 		}
+		if stop != nil {
+			defer stop()
+		}
+		written, err := writerTo.WriteTo(dst)
+		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return written, ctxErr
+			}
+			return written, err
+		}
+		return written, nil
 	}
 
 	buf := make([]byte, 32*1024)
