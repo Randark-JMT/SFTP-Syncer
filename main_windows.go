@@ -51,6 +51,7 @@ type appWindow struct {
 	syncMu                   sync.Mutex
 	syncCancel               context.CancelFunc
 	syncRunning              bool
+	taskRefreshStop          chan struct{}
 }
 
 // fileTaskEntry holds the current download state for a single remote file.
@@ -321,7 +322,7 @@ func (aw *appWindow) buildUI() error {
 	return (MainWindow{
 		AssignTo: &aw.MainWindow,
 		Name:     "SFTPSyncerMainWindow",
-		Title:    "SFTP Syncer",
+		Title:    "SFTP Syncer v0.5.2",
 		MinSize:  Size{Width: 820, Height: 800},
 		Size:     Size{Width: 920, Height: 900},
 		Layout:   VBox{},
@@ -645,6 +646,7 @@ func (aw *appWindow) startSync() {
 	aw.setStatus("状态：运行中")
 	aw.appendLog(fmt.Sprintf("开始同步：服务器=%s:%d，远程目录=%s，本地目录=%s，轮询间隔=%d 秒。", cfg.Host, cfg.Port, cfg.RemoteDir, cfg.LocalDir, cfg.PollIntervalSeconds))
 
+	aw.startTaskRefresh()
 	go aw.runSyncLoop(ctx, cfg)
 }
 
@@ -660,6 +662,8 @@ func (aw *appWindow) runSyncLoop(ctx context.Context, cfg config.Config) {
 		aw.syncRunning = false
 		aw.syncCancel = nil
 		aw.syncMu.Unlock()
+
+		aw.stopTaskRefresh()
 
 		if aw.MainWindow != nil && !aw.IsDisposed() {
 			aw.Synchronize(func() {
@@ -772,17 +776,42 @@ func (aw *appWindow) setStatus(text string) {
 }
 
 func (aw *appWindow) handleProgress(evt syncer.ProgressEvent) {
-	row := aw.taskModel.updateEntry(evt)
-	if aw.MainWindow == nil || aw.IsDisposed() {
-		return
-	}
-	aw.Synchronize(func() {
-		if row < 0 {
-			aw.taskModel.PublishRowsReset()
-		} else {
-			aw.taskModel.PublishRowChanged(row)
+	aw.taskModel.updateEntry(evt)
+}
+
+// startTaskRefresh launches a goroutine that repaints the task table every 500 ms.
+// PublishRowsReset uses LVSICF_NOINVALIDATEALL, so it won't repaint existing rows
+// when the count is unchanged. We must call taskView.Invalidate() which calls
+// InvalidateRect on the internal ListView HWNDs and triggers LVN_GETDISPINFO to
+// pull fresh data from the model for every visible row.
+func (aw *appWindow) startTaskRefresh() {
+	stop := make(chan struct{})
+	aw.taskRefreshStop = stop
+	go func() {
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				if aw.MainWindow == nil || aw.IsDisposed() {
+					return
+				}
+				aw.Synchronize(func() {
+					aw.taskModel.PublishRowsReset()
+					_ = aw.taskView.Invalidate()
+				})
+			}
 		}
-	})
+	}()
+}
+
+func (aw *appWindow) stopTaskRefresh() {
+	if aw.taskRefreshStop != nil {
+		close(aw.taskRefreshStop)
+		aw.taskRefreshStop = nil
+	}
 }
 
 func (aw *appWindow) appendLog(message string) {
