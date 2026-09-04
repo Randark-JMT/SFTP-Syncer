@@ -69,6 +69,30 @@ func TestIsFileInChildDirectory(t *testing.T) {
 	}
 }
 
+func TestHiddenRemoteDir(t *testing.T) {
+	tests := []struct {
+		name       string
+		remoteRoot string
+		dirPath    string
+		want       bool
+	}{
+		{name: "regular dir", remoteRoot: "/recordings", dirPath: "/recordings/2026-05-13", want: false},
+		{name: "dot dir inside root", remoteRoot: "/recordings", dirPath: "/recordings/.git", want: true},
+		{name: "nested dot dir", remoteRoot: "/recordings", dirPath: "/recordings/day/.cache", want: true},
+		{name: "root itself is never hidden", remoteRoot: "/data/.incoming", dirPath: "/data/.incoming", want: false},
+		{name: "dot dir inside dot root", remoteRoot: "/data/.incoming", dirPath: "/data/.incoming/.git", want: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := hiddenRemoteDir(tt.remoteRoot, tt.dirPath)
+			if got != tt.want {
+				t.Fatalf("expected %v, got %v", tt.want, got)
+			}
+		})
+	}
+}
+
 func TestCopyWithContextUsesWriterTo(t *testing.T) {
 	reader := &writerToProbe{data: []byte("hello over sftp")}
 	var dst bytes.Buffer

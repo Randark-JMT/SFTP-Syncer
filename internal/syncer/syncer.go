@@ -37,6 +37,7 @@ type Result struct {
 	SkippedRecent     int
 	SkippedNonRegular int
 	SkippedRootFiles  int
+	SkippedHiddenDirs int
 	AlreadyPresent    int
 }
 
@@ -85,7 +86,10 @@ const (
 )
 
 // ProgressEvent carries per-file progress information to the caller.
+// HostID and HostLabel identify which managed host the event belongs to.
 type ProgressEvent struct {
+	HostID     string
+	HostLabel  string
 	RemotePath string
 	State      ProgressState
 	Downloaded int64
@@ -101,6 +105,8 @@ type Service struct {
 	now        func() time.Time
 	onProgress ProgressCallback
 	pool       *workerPool
+	hostID     string
+	hostLabel  string
 }
 
 func NewService(logger Logger) *Service {
@@ -110,15 +116,25 @@ func NewService(logger Logger) *Service {
 	}
 }
 
+// SetHost records the host identity stamped onto progress events. It must be
+// called before RunOnce so that pool workers observe stable values.
+func (s *Service) SetHost(id, label string) {
+	s.hostID = id
+	s.hostLabel = label
+}
+
 // SetProgressCallback registers a callback for per-file download progress updates.
 func (s *Service) SetProgressCallback(cb ProgressCallback) {
 	s.onProgress = cb
 }
 
 func (s *Service) notifyProgress(evt ProgressEvent) {
-	if s.onProgress != nil {
-		s.onProgress(evt)
+	if s.onProgress == nil {
+		return
 	}
+	evt.HostID = s.hostID
+	evt.HostLabel = s.hostLabel
+	s.onProgress(evt)
 }
 
 func (s *Service) RunOnce(ctx context.Context, cfg config.Config) (Result, error) {
@@ -172,6 +188,11 @@ func (s *Service) RunOnce(ctx context.Context, cfg config.Config) (Result, error
 		}
 
 		if info.IsDir() {
+			if hiddenRemoteDir(remoteRoot, walker.Path()) {
+				result.SkippedHiddenDirs++
+				s.logf("跳过以点开头的目录: %s", normalizeRemotePath(walker.Path()))
+				walker.SkipDir()
+			}
 			continue
 		}
 
@@ -643,6 +664,17 @@ func (pw *progressWriter) Write(p []byte) (int, error) {
 
 func eligibleForTransfer(modTimeUTC, nowUTC time.Time, quietPeriod time.Duration) bool {
 	return !modTimeUTC.After(nowUTC.UTC().Add(-quietPeriod))
+}
+
+// hiddenRemoteDir reports whether dirPath names a dot-prefixed directory
+// underneath remoteRoot. The root itself is never treated as hidden, so a
+// root such as /data/.incoming keeps working.
+func hiddenRemoteDir(remoteRoot, dirPath string) bool {
+	normalized := normalizeRemotePath(dirPath)
+	if normalized == remoteRoot {
+		return false
+	}
+	return strings.HasPrefix(path.Base(normalized), ".")
 }
 
 func targetLocalPath(localRoot, remoteRoot, remotePath string) (string, error) {

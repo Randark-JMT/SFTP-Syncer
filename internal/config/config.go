@@ -1,24 +1,32 @@
 package config
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 const (
 	appDirName          = "SFTP-Syncer"
 	configFileName      = "config.json"
+	hostsFileName       = "hosts.json"
 	defaultPort         = 22
 	defaultPollInterval = 30
 	AuthModePassword    = "password"
 	AuthModePrivateKey  = "private_key"
 )
 
+// Config holds the settings of a single sync host. ID and Name identify the
+// host within the host manager store; the remaining fields drive the syncer.
 type Config struct {
+	ID                    string `json:"id,omitempty"`
+	Name                  string `json:"name,omitempty"`
 	Host                  string `json:"host"`
 	Port                  int    `json:"port"`
 	Username              string `json:"username"`
@@ -31,6 +39,18 @@ type Config struct {
 	PollIntervalSeconds   int    `json:"pollIntervalSeconds"`
 	SkipHostKeyValidation bool   `json:"skipHostKeyValidation"`
 	KnownHostsPath        string `json:"knownHostsPath"`
+}
+
+// DisplayName returns the user-visible label of the host: the configured
+// name when present, falling back to host:port.
+func (c Config) DisplayName() string {
+	if c.Name != "" {
+		return c.Name
+	}
+	if c.Host == "" {
+		return "未命名主机"
+	}
+	return fmt.Sprintf("%s:%d", c.Host, c.Port)
 }
 
 func Default() Config {
@@ -90,6 +110,8 @@ func (c Config) Validate() error {
 
 func (c Config) Normalized() Config {
 	cfg := c
+	cfg.ID = strings.TrimSpace(cfg.ID)
+	cfg.Name = strings.TrimSpace(cfg.Name)
 	cfg.Host = strings.TrimSpace(cfg.Host)
 	cfg.Username = strings.TrimSpace(cfg.Username)
 	cfg.AuthMode = strings.ToLower(strings.TrimSpace(cfg.AuthMode))
@@ -151,22 +173,133 @@ func Load() (Config, error) {
 	return cfg.Normalized(), nil
 }
 
-func Save(cfg Config) error {
-	path, err := ConfigPath()
+// Store is the persisted collection of hosts managed by the host manager.
+type Store struct {
+	Hosts []Config `json:"hosts"`
+}
+
+func StorePath() (string, error) {
+	base, err := os.UserConfigDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(base, appDirName, hostsFileName), nil
+}
+
+// LoadStore loads hosts.json. When the file does not exist yet, a legacy
+// single-host config.json (if present) is migrated into the store and saved.
+func LoadStore() (*Store, error) {
+	store := &Store{}
+	path, err := StorePath()
+	if err != nil {
+		return store, err
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return store, err
+		}
+		return migrateLegacyStore()
+	}
+	if err := json.Unmarshal(data, store); err != nil {
+		return store, fmt.Errorf("解析主机列表失败: %w", err)
+	}
+	for i := range store.Hosts {
+		store.Hosts[i] = store.Hosts[i].Normalized()
+		if store.Hosts[i].ID == "" {
+			store.Hosts[i].ID = NewHostID()
+		}
+	}
+	return store, nil
+}
+
+// migrateLegacyStore converts the pre-host-manager single-host config.json
+// into a hosts.json entry on first launch.
+func migrateLegacyStore() (*Store, error) {
+	store := &Store{}
+	legacy, err := Load()
+	if err != nil || strings.TrimSpace(legacy.Host) == "" {
+		return store, err
+	}
+	legacy.ID = NewHostID()
+	legacy.Name = "默认主机"
+	store.Hosts = append(store.Hosts, legacy)
+	if err := store.Save(); err != nil {
+		return store, fmt.Errorf("迁移旧配置失败: %w", err)
+	}
+	return store, nil
+}
+
+func (s *Store) Save() error {
+	path, err := StorePath()
 	if err != nil {
 		return err
 	}
-
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-
-	payload, err := json.MarshalIndent(cfg.Normalized(), "", "  ")
+	payload, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
 		return err
 	}
-
 	return os.WriteFile(path, payload, 0o600)
+}
+
+// Find returns the host with the given ID.
+func (s *Store) Find(id string) (Config, bool) {
+	for _, h := range s.Hosts {
+		if h.ID == id {
+			return h, true
+		}
+	}
+	return Config{}, false
+}
+
+// Add appends a new host, assigning a fresh ID when the host has none.
+func (s *Store) Add(cfg Config) Config {
+	cfg = cfg.Normalized()
+	if cfg.ID == "" {
+		cfg.ID = NewHostID()
+	}
+	s.Hosts = append(s.Hosts, cfg)
+	return cfg
+}
+
+// Update replaces the host that shares cfg's ID. It reports whether a host
+// with that ID existed.
+func (s *Store) Update(cfg Config) bool {
+	if cfg.ID == "" {
+		return false
+	}
+	for i := range s.Hosts {
+		if s.Hosts[i].ID == cfg.ID {
+			s.Hosts[i] = cfg.Normalized()
+			return true
+		}
+	}
+	return false
+}
+
+// Remove drops the host with the given ID. It reports whether a host with
+// that ID existed.
+func (s *Store) Remove(id string) bool {
+	for i := range s.Hosts {
+		if s.Hosts[i].ID == id {
+			s.Hosts = append(s.Hosts[:i], s.Hosts[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
+// NewHostID returns a random identifier for a host entry.
+func NewHostID() string {
+	buf := make([]byte, 8)
+	if _, err := rand.Read(buf); err != nil {
+		return fmt.Sprintf("h%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(buf)
 }
 
 func EffectiveKnownHostsPath(cfg Config) (string, error) {
