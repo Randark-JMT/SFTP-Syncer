@@ -24,8 +24,23 @@ import (
 const QuietPeriod = 30 * time.Minute
 
 const (
-	maxDownloadWorkers = 4
+	// maxDownloadWorkers 决定单台主机同时进行的文件传输数。FileZilla 默认
+	// 为 10 条并发传输，这里对齐以充分利用带宽。
+	maxDownloadWorkers = 10
 	workerCooldown     = 10 * time.Second
+)
+
+const (
+	// SFTP 一次 READ 请求的有效载荷上限决定了单连接的吞吐：带宽 ≈
+	// 包大小 × 并发请求数 / RTT。协议标准要求服务器至少支持 32KB，默认值
+	// 即 32KB，在高延迟链路上会成为明显瓶颈。256KB 是 OpenSSH 等主流
+	// 服务器实际支持的上限（SSH_FXP_READ 的 Len 字段为 uint32，OpenSSH
+	// 内部缓冲 256KB），配合更大的在途窗口可显著提高单文件速度。
+	sftpMaxPacket = 256 * 1024
+	// sftpMaxConcurrentRequests 是单个文件允许的在途读请求数上限。默认 64
+	// 搭配 32KB 包时窗口只有 2MB，无法填满高 BDP 链路；256 × 256KB 提供
+	// 最大 64MB 的在途窗口。
+	sftpMaxConcurrentRequests = 256
 )
 
 type Logger func(format string, args ...any)
@@ -260,6 +275,8 @@ func (s *Service) newSFTPClient(conn *ssh.Client) (*sftp.Client, error) {
 		conn,
 		sftp.UseConcurrentReads(true),
 		sftp.UseFstat(true),
+		sftp.MaxPacketUnchecked(sftpMaxPacket),
+		sftp.MaxConcurrentRequestsPerFile(sftpMaxConcurrentRequests),
 	)
 }
 
