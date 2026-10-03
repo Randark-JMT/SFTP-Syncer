@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -41,9 +42,44 @@ const (
 	// 搭配 32KB 包时窗口只有 2MB，无法填满高 BDP 链路；256 × 256KB 提供
 	// 最大 64MB 的在途窗口。
 	sftpMaxConcurrentRequests = 256
+
+	// downloadChunkSize 是本地下载器单个 ReadAt 请求的读块大小。多个读块
+	// 通过若干并发 ReadAt 调用填满在途窗口（downloadConcurrency 决定上限）。
+	downloadChunkSize   = sftpMaxPacket
+	downloadConcurrency = sftpMaxConcurrentRequests
 )
 
 type Logger func(format string, args ...any)
+
+// Level is a log severity. The zero value is LevelInfo so a plain Logger
+// keeps the historical INFO behaviour.
+type Level int
+
+const (
+	LevelInfo Level = iota
+	LevelSuccess
+	LevelWarn
+	LevelError
+)
+
+// Prefix returns the bracketed tag prepended to leveled messages, e.g.
+// "[ERROR] ". UI layers key off this tag to colourise log lines.
+func (l Level) Prefix() string {
+	switch l {
+	case LevelSuccess:
+		return "[OK] "
+	case LevelWarn:
+		return "[WARN] "
+	case LevelError:
+		return "[ERROR] "
+	default:
+		return ""
+	}
+}
+
+// LevelLogger is a severity-aware logger. Register it via NewServiceLevel to
+// receive leveled messages natively instead of "[LEVEL] " text prefixes.
+type LevelLogger func(level Level, format string, args ...any)
 
 type Result struct {
 	Scanned           int
@@ -116,7 +152,7 @@ type ProgressEvent struct {
 type ProgressCallback func(ProgressEvent)
 
 type Service struct {
-	logger     Logger
+	logger     LevelLogger
 	now        func() time.Time
 	onProgress ProgressCallback
 	pool       *workerPool
@@ -124,7 +160,18 @@ type Service struct {
 	hostLabel  string
 }
 
+// NewService wraps a plain Logger. Severity is encoded as a "[LEVEL] " text
+// prefix so plain-log consumers can still distinguish severities.
 func NewService(logger Logger) *Service {
+	return NewServiceLevel(func(level Level, format string, args ...any) {
+		if logger != nil {
+			logger(level.Prefix()+format, args...)
+		}
+	})
+}
+
+// NewServiceLevel registers a severity-aware LevelLogger.
+func NewServiceLevel(logger LevelLogger) *Service {
 	return &Service{
 		logger: logger,
 		now:    time.Now,
@@ -193,7 +240,7 @@ func (s *Service) RunOnce(ctx context.Context, cfg config.Config) (Result, error
 		}
 
 		if err := walker.Err(); err != nil {
-			s.logf("遍历失败: %v", err)
+			s.logWarn("遍历失败: %v", err)
 			continue
 		}
 
@@ -234,13 +281,13 @@ func (s *Service) RunOnce(ctx context.Context, cfg config.Config) (Result, error
 
 		localPath, err := targetLocalPath(localRoot, remoteRoot, remotePath)
 		if err != nil {
-			s.logf("无法计算本地路径（%s）: %v", remotePath, err)
+			s.logWarn("无法计算本地路径（%s）: %v", remotePath, err)
 			continue
 		}
 
 		if same, err := sameLocalFile(localPath, info); err == nil && same {
 			if err := client.Remove(remotePath); err != nil {
-				s.logf("本地已存在同名同时间文件，但删除远程文件失败（%s）: %v", remotePath, err)
+				s.logWarn("本地已存在同名同时间文件，但删除远程文件失败（%s）: %v", remotePath, err)
 				continue
 			}
 			result.AlreadyPresent++
@@ -399,7 +446,7 @@ func (w *poolWorker) disconnect() {
 
 func (w *poolWorker) enterCooldown() {
 	w.coolUntil = time.Now().Add(workerCooldown)
-	w.service.logf("Worker %d 进入 %v 冷却。", w.id+1, workerCooldown)
+	w.service.logWarn("Worker %d 进入 %v 冷却。", w.id+1, workerCooldown)
 	w.disconnect()
 }
 
@@ -412,7 +459,7 @@ func (w *poolWorker) executeTask(ctx context.Context, task workerTask) {
 	}
 
 	if err := os.MkdirAll(filepath.Dir(dl.localPath), 0o755); err != nil {
-		w.service.logf("创建本地目录失败（%s）: %v", dl.localPath, err)
+		w.service.logError("创建本地目录失败（%s）: %v", dl.localPath, err)
 		w.service.notifyProgress(ProgressEvent{RemotePath: dl.remotePath, State: ProgressStateFailed, Total: dl.info.Size()})
 		task.result <- downloadOutcome{}
 		return
@@ -421,7 +468,7 @@ func (w *poolWorker) executeTask(ctx context.Context, task workerTask) {
 	w.service.notifyProgress(ProgressEvent{RemotePath: dl.remotePath, State: ProgressStateActive, Total: dl.info.Size()})
 
 	if err := w.connect(); err != nil {
-		w.service.logf("Worker %d 连接失败，进入冷却（%s）: %v", w.id+1, dl.remotePath, err)
+		w.service.logError("Worker %d 连接失败，进入冷却（%s）: %v", w.id+1, dl.remotePath, err)
 		w.service.notifyProgress(ProgressEvent{RemotePath: dl.remotePath, State: ProgressStateFailed, Total: dl.info.Size()})
 		w.enterCooldown()
 		task.result <- downloadOutcome{}
@@ -433,7 +480,7 @@ func (w *poolWorker) executeTask(ctx context.Context, task workerTask) {
 			task.result <- downloadOutcome{}
 			return
 		}
-		w.service.logf("Worker %d 下载失败，进入冷却（%s）: %v", w.id+1, dl.remotePath, err)
+		w.service.logError("Worker %d 下载失败，进入冷却（%s）: %v", w.id+1, dl.remotePath, err)
 		w.service.notifyProgress(ProgressEvent{RemotePath: dl.remotePath, State: ProgressStateFailed, Total: dl.info.Size()})
 		w.enterCooldown()
 		task.result <- downloadOutcome{}
@@ -442,10 +489,10 @@ func (w *poolWorker) executeTask(ctx context.Context, task workerTask) {
 
 	outcome := downloadOutcome{downloaded: true}
 	if err := w.client.Remove(dl.remotePath); err != nil {
-		w.service.logf("下载完成，但删除远程文件失败（%s）: %v", dl.remotePath, err)
+		w.service.logWarn("下载完成，但删除远程文件失败（%s）: %v", dl.remotePath, err)
 	} else {
 		outcome.deleted = true
-		w.service.logf("已同步并删除远程文件: %s -> %s", dl.remotePath, dl.localPath)
+		w.service.logSuccess("已同步并删除远程文件: %s -> %s", dl.remotePath, dl.localPath)
 	}
 
 	w.service.notifyProgress(ProgressEvent{
@@ -533,6 +580,13 @@ func (s *Service) downloadFile(ctx context.Context, client *sftp.Client, remoteP
 	}
 	defer remoteFile.Close()
 
+	// Re-stat the file so size validation does not rely on a stale size
+	// captured during the (potentially long) directory scan.
+	expectSize := info.Size()
+	if fi, err := remoteFile.Stat(); err == nil && fi.Size() > 0 {
+		expectSize = fi.Size()
+	}
+
 	tempPath := localPath + ".partial"
 	_ = os.Remove(tempPath)
 
@@ -540,7 +594,7 @@ func (s *Service) downloadFile(ctx context.Context, client *sftp.Client, remoteP
 	if err != nil {
 		return err
 	}
-	s.logf("开始下载: %s -> %s (%d 字节)", remotePath, localPath, info.Size())
+	s.logf("开始下载: %s -> %s (%d 字节)", remotePath, localPath, expectSize)
 
 	pw := &progressWriter{
 		Writer:   localFile,
@@ -550,13 +604,13 @@ func (s *Service) downloadFile(ctx context.Context, client *sftp.Client, remoteP
 				RemotePath: remotePath,
 				State:      ProgressStateActive,
 				Downloaded: downloaded,
-				Total:      info.Size(),
+				Total:      expectSize,
 				SpeedBps:   speedBps,
 			})
 		},
 	}
 
-	copied, copyErr := copyWithContext(ctx, pw, remoteFile)
+	copied, copyErr := copyRemoteFile(ctx, remoteFile, pw, expectSize)
 	closeErr := localFile.Close()
 	if copyErr != nil {
 		_ = os.Remove(tempPath)
@@ -566,11 +620,11 @@ func (s *Service) downloadFile(ctx context.Context, client *sftp.Client, remoteP
 		_ = os.Remove(tempPath)
 		return closeErr
 	}
-	if copied != info.Size() {
+	if copied != expectSize {
 		_ = os.Remove(tempPath)
-		return fmt.Errorf("下载字节数不匹配，期望 %d，实际 %d", info.Size(), copied)
+		return fmt.Errorf("下载字节数不匹配，期望 %d，实际 %d", expectSize, copied)
 	}
-	s.logf("下载完成: %s (%d 字节)", remotePath, copied)
+	s.logSuccess("下载完成: %s (%d 字节)", remotePath, copied)
 
 	if err := os.Remove(localPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		_ = os.Remove(tempPath)
@@ -587,6 +641,141 @@ func (s *Service) downloadFile(ctx context.Context, client *sftp.Client, remoteP
 	}
 
 	return nil
+}
+
+// copyRemoteFile transfers an SFTP file to dst, honouring ctx cancellation.
+// It first attempts a concurrent transfer when the file size is known and the
+// file implements io.ReaderAt (true for *sftp.File); on a size mismatch from
+// the concurrent path it retries once sequentially. If the concurrent path
+// itself errors, that error is returned as-is (the destination content is
+// indeterminate on error, and the caller removes the .partial file anyway).
+//
+// The concurrent path exists because pkg/sftp's built-in concurrent WriteTo
+// treats any short SFTP read as io.EOF. SFTP READ replies are message-based
+// and may legitimately return fewer bytes than requested; some servers do so
+// under load. readAtFull closes that gap with io.ReadFull semantics.
+func copyRemoteFile(ctx context.Context, src *sftp.File, dst io.Writer, size int64) (int64, error) {
+	if size > 0 {
+		written, err := copyRemoteFileConcurrent(ctx, src, dst, size)
+		if err != nil {
+			return 0, err
+		}
+		if written == size {
+			return written, nil
+		}
+		// The file changed size between the initial stat and the transfer.
+		// Rewind and fall through to a sequential rewrite from scratch.
+		if _, err := src.Seek(0, io.SeekStart); err != nil {
+			return 0, err
+		}
+	}
+	return copyWithContext(ctx, dst, src)
+}
+
+// copyRemoteFileConcurrent downloads exactly size bytes from src into dst
+// using bounded concurrent ReadAt calls (io.ReadFull semantics), writing the
+// chunks to dst strictly in offset order so dst needs no Seek. It is
+// cancellation-aware via ctx: on cancellation the reader is closed, which
+// aborts the in-flight SFTP requests, and context.Canceled is returned.
+func copyRemoteFileConcurrent(ctx context.Context, src io.ReadCloser, dst io.Writer, size int64) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+
+	// Close src on cancellation so in-flight ReadAt calls abort promptly.
+	stop := context.AfterFunc(ctx, func() { _ = src.Close() })
+	defer stop()
+
+	ra, ok := src.(io.ReaderAt)
+	if !ok {
+		return 0, errors.New("reader does not support ReadAt")
+	}
+
+	type chunk struct {
+		data []byte
+		err  error
+	}
+
+	// results[i] receives chunk i. All channels are closed by their worker
+	// exactly once, so the writer can detect completion without extra
+	// synchronisation.
+	nChunks := int((size + downloadChunkSize - 1) / downloadChunkSize)
+	results := make([]chan chunk, nChunks)
+	for i := range results {
+		results[i] = make(chan chunk, 1)
+	}
+
+	go func() {
+		sem := make(chan struct{}, downloadConcurrency)
+		var wg sync.WaitGroup
+		for i := 0; i < nChunks; i++ {
+			off := int64(i) * downloadChunkSize
+			end := off + downloadChunkSize
+			if end > size {
+				end = size
+			}
+			buf := make([]byte, end-off)
+			sem <- struct{}{}
+			wg.Add(1)
+			go func(i int, off int64, buf []byte) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				defer close(results[i])
+				n, err := readAtFull(ra, buf, off)
+				if err == nil {
+					err = ctx.Err()
+				}
+				results[i] <- chunk{data: buf[:n], err: err}
+			}(i, off, buf)
+		}
+		wg.Wait()
+	}()
+
+	written := int64(0)
+	for _, rc := range results {
+		c, ok := <-rc
+		if !ok {
+			// Worker exited without sending (shouldn't happen).
+			break
+		}
+		if len(c.data) > 0 {
+			n, err := dst.Write(c.data)
+			written += int64(n)
+			if err != nil {
+				return written, err
+			}
+			if n != len(c.data) {
+				return written, io.ErrShortWrite
+			}
+		}
+		if c.err != nil {
+			return written, c.err
+		}
+	}
+
+	return written, ctx.Err()
+}
+
+// readAtFull reads exactly len(b) bytes from ra starting at off, retrying
+// short reads. Unlike io.ReadFull with an arbitrary ReaderAt, EOF before any
+// byte is read returns io.EOF, and EOF after partial data returns
+// io.ErrUnexpectedEOF.
+func readAtFull(ra io.ReaderAt, b []byte, off int64) (int, error) {
+	total := 0
+	for total < len(b) {
+		n, err := ra.ReadAt(b[total:], off+int64(total))
+		total += n
+		if err != nil {
+			if err == io.EOF && total > 0 {
+				return total, io.ErrUnexpectedEOF
+			}
+			return total, err
+		}
+		if n == 0 {
+			return total, io.ErrNoProgress
+		}
+	}
+	return total, nil
 }
 
 // copyWithContext copies src → dst, preferring the WriterTo fast path when
@@ -757,7 +946,16 @@ func sameLocalFile(localPath string, remoteInfo os.FileInfo) (bool, error) {
 }
 
 func (s *Service) logf(format string, args ...any) {
+	s.logLevel(LevelInfo, format, args...)
+}
+
+// logLevel logs at the given severity.
+func (s *Service) logLevel(level Level, format string, args ...any) {
 	if s.logger != nil {
-		s.logger(format, args...)
+		s.logger(level, format, args...)
 	}
 }
+
+func (s *Service) logSuccess(format string, args ...any) { s.logLevel(LevelSuccess, format, args...) }
+func (s *Service) logWarn(format string, args ...any)    { s.logLevel(LevelWarn, format, args...) }
+func (s *Service) logError(format string, args ...any)   { s.logLevel(LevelError, format, args...) }

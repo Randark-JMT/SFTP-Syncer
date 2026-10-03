@@ -141,6 +141,96 @@ func TestCopyWithContextCancelsWriterToReader(t *testing.T) {
 	}
 }
 
+// shortReadAt simulates an SFTP server that returns fewer bytes than
+// requested per ReadAt, which is the exact failure that motivated readAtFull.
+type shortReadAt struct {
+	data []byte
+	max  int // per-call byte cap
+}
+
+func (s *shortReadAt) ReadAt(p []byte, off int64) (int, error) {
+	if off >= int64(len(s.data)) {
+		return 0, io.EOF
+	}
+	n := len(p)
+	if s.max > 0 && n > s.max {
+		n = s.max
+	}
+	if rem := len(s.data) - int(off); n > rem {
+		n = rem
+	}
+	copy(p, s.data[off:off+int64(n)])
+	if n < len(p) && off+int64(n) >= int64(len(s.data)) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+func (s *shortReadAt) Read(p []byte) (int, error) { return 0, io.EOF } // unused in these tests
+func (s *shortReadAt) Close() error               { return nil }
+
+func TestReadAtFullRetriesShortReads(t *testing.T) {
+	data := []byte("0123456789abcdef")
+	ra := &shortReadAt{data: data, max: 5}
+
+	buf := make([]byte, len(data))
+	n, err := readAtFull(ra, buf, 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if n != len(data) {
+		t.Fatalf("expected %d bytes, got %d", len(data), n)
+	}
+	if !bytes.Equal(buf, data) {
+		t.Fatalf("expected %q, got %q", data, buf)
+	}
+}
+
+func TestReadAtFullUnexpectedEOF(t *testing.T) {
+	ra := &shortReadAt{data: []byte("short"), max: 3}
+	buf := make([]byte, 10)
+	_, err := readAtFull(ra, buf, 0)
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("expected io.ErrUnexpectedEOF, got %v", err)
+	}
+}
+
+func TestCopyRemoteFileConcurrentWritesInOrder(t *testing.T) {
+	// 300 KB forces multiple chunks and multiple concurrent workers.
+	size := 300 * 1024
+	data := make([]byte, size)
+	for i := range data {
+		data[i] = byte(i * 31)
+	}
+	// 7KB per ReadAt forces the concurrent path to retry short reads heavily.
+	src := &shortReadAt{data: data, max: 7 * 1024}
+	var dst bytes.Buffer
+
+	written, err := copyRemoteFileConcurrent(context.Background(), src, &dst, int64(size))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if written != int64(size) {
+		t.Fatalf("expected %d bytes written, got %d", size, written)
+	}
+	if !bytes.Equal(dst.Bytes(), data) {
+		t.Fatal("downloaded bytes differ from source data")
+	}
+}
+
+func TestCopyRemoteFileConcurrentCancellation(t *testing.T) {
+	size := int64(downloadChunkSize * 4)
+	data := make([]byte, size)
+	src := &shortReadAt{data: data, max: 1024}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // already cancelled
+
+	_, err := copyRemoteFileConcurrent(ctx, src, io.Discard, size)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+}
+
 type writerToProbe struct {
 	data         []byte
 	usedWriterTo bool

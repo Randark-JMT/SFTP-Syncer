@@ -46,12 +46,12 @@ type appWindow struct {
 	stopAllButton    *walk.PushButton
 
 	statusLabel         *walk.Label
-	logView             *walk.TextEdit
+	logView             *logView
 	taskView            *walk.TableView
 	taskModel           *fileTaskModel
 	tray                *walk.NotifyIcon
 	trayHintShown       bool
-	logLines            []string
+	logLines            []logLine
 	exiting             bool
 	allowMinimizeToTray bool
 
@@ -181,7 +181,7 @@ func (aw *appWindow) buildUI() error {
 						Layout: VBox{MarginsZero: true},
 						Children: []Widget{
 							Label{Text: "日志"},
-							TextEdit{AssignTo: &aw.logView, ReadOnly: true, VScroll: true},
+							LogView{AssignTo: &aw.logView},
 						},
 					},
 				},
@@ -288,7 +288,7 @@ func (aw *appWindow) showFromTray() {
 func (aw *appWindow) loadHosts() {
 	store, err := config.LoadStore()
 	if err != nil {
-		aw.appendLog(fmt.Sprintf("加载主机列表失败：%v", err))
+		aw.appendLogLevel(logLevelError, fmt.Sprintf("加载主机列表失败：%v", err))
 	}
 	if store == nil {
 		store = &config.Store{}
@@ -536,8 +536,8 @@ func (aw *appWindow) startHost(id string) {
 	}
 	label := cfg.DisplayName()
 	ctx, cancel := context.WithCancel(context.Background())
-	service := syncer.NewService(func(format string, args ...any) {
-		aw.appendLog(fmt.Sprintf("[%s] %s", label, fmt.Sprintf(format, args...)))
+	service := syncer.NewServiceLevel(func(level syncer.Level, format string, args ...any) {
+		aw.appendLogLevel(logLevelFromSyncer(level), fmt.Sprintf("[%s] %s", label, fmt.Sprintf(format, args...)))
 	})
 	service.SetHost(cfg.ID, label)
 	service.SetProgressCallback(aw.handleProgress)
@@ -606,7 +606,7 @@ func (aw *appWindow) runHostLoop(ctx context.Context, cfg config.Config, service
 			if ctx.Err() != nil {
 				return
 			}
-			aw.appendLog(fmt.Sprintf("[%s] 本轮同步失败：%v", label, err))
+			aw.appendLogLevel(logLevelError, fmt.Sprintf("[%s] 本轮同步失败：%v", label, err))
 			aw.setHostStatus(cfg.ID, hostStatusError)
 		} else {
 			aw.appendLog(fmt.Sprintf("[%s] 本轮完成：扫描 %d 个文件，下载 %d，删除远程文件 %d，跳过根目录散文件 %d，跳过最近 30 分钟 %d，跳过非常规条目 %d，跳过隐藏目录 %d，本地已存在并直接删远程 %d。",
@@ -686,22 +686,33 @@ func (aw *appWindow) stopTaskRefresh() {
 	}
 }
 
+// appendLog appends an INFO-level message; see appendLogLevel.
 func (aw *appWindow) appendLog(message string) {
+	aw.appendLogLevel(logLevelInfo, message)
+}
+
+// appendLogLevel appends one timestamped, severity-coloured line to the log
+// view. It is safe to call from any goroutine.
+func (aw *appWindow) appendLogLevel(level logLevel, message string) {
 	if aw.MainWindow == nil || aw.IsDisposed() || aw.logView == nil {
 		return
 	}
 
-	line := fmt.Sprintf("[%s] %s", time.Now().Format("15:04:05"), strings.TrimSpace(message))
+	line := logLine{
+		level: level,
+		text:  fmt.Sprintf("[%s] %s", time.Now().Format("15:04:05"), strings.TrimSpace(message)),
+	}
 	aw.Synchronize(func() {
 		if aw.MainWindow == nil || aw.IsDisposed() || aw.logView == nil {
 			return
 		}
 		aw.logLines = append(aw.logLines, line)
-		if len(aw.logLines) > 500 {
-			aw.logLines = aw.logLines[len(aw.logLines)-500:]
+		if len(aw.logLines) > maxLogLines {
+			aw.logLines = append([]logLine(nil), aw.logLines[len(aw.logLines)-maxLogLines:]...)
+			aw.logView.replaceLines(aw.logLines)
+		} else {
+			aw.logView.appendLines(aw.logLines[len(aw.logLines)-1:])
 		}
-		_ = aw.logView.SetText(strings.Join(aw.logLines, "\r\n"))
-		aw.logView.SendMessage(win.WM_VSCROLL, win.SB_BOTTOM, 0)
 	})
 }
 
