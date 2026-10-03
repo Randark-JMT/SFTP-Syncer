@@ -49,6 +49,12 @@
 
 `go build -ldflags="-H windowsgui" -o SFTP-Syncer.exe .`
 
+版本号独立定义在 `version.go` 的 `Version` 变量中（默认 `dev`），窗口标题会显示该版本号。构建时可通过 `-X` 覆盖：
+
+`go build -ldflags="-H windowsgui -X main.Version=v0.7.0" -o SFTP-Syncer.exe .`
+
+也可以通过 GitHub Actions 手动触发 **Release** 工作流（`workflow_dispatch`），输入版本号后会自动编译 Windows 可执行文件并发布对应的 GitHub Release。
+
 > **首次构建前必须先生成资源文件**：可执行文件需要嵌入 `app.manifest`（声明 comctl32 v6 依赖），否则 GUI 初始化会失败（`TTM_ADDTOOL failed`）。仓库的 `.gitignore` 忽略了 `*.syso`，克隆后请先执行一次：
 >
 > `go run github.com/akavel/rsrc@latest -manifest app.manifest -arch amd64 -o rsrc_windows_amd64.syso`
