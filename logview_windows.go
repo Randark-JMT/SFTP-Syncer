@@ -3,7 +3,6 @@
 package main
 
 import (
-	"strings"
 	"unsafe"
 
 	"github.com/lxn/walk"
@@ -60,11 +59,9 @@ var msfteditDLL = windows.NewLazySystemDLL("msftedit.dll")
 // (MSFTEDIT_CLASS, "RICHEDIT50W", present since Windows XP SP1). The control
 // HWND is created directly; walk.InitWidget then adopts it into the widget
 // tree by subclassing its WndProc. If the RichEdit class is unavailable the
-// widget degrades to a plain walk.TextEdit so the app stays usable.
+// widget degrades to a plain EDIT control so the app stays usable.
 type logView struct {
 	walk.WidgetBase
-	hwnd      win.HWND
-	fallback  *walk.TextEdit
 	textColor win.COLORREF
 }
 
@@ -85,41 +82,32 @@ func newLogView(parent walk.Container) (*logView, error) {
 			parent.Handle(), 0, 0, nil,
 		)
 		if hwnd != 0 {
-			lv.hwnd = hwnd
+			// Handle() reports the pre-created HWND, so InitWidget adopts it
+			// instead of creating a new window. WS_VISIBLE must be passed so
+			// walk marks the widget visible and includes it in layout.
+			if err := walk.InitWidget(lv, parent, "", win.WS_VISIBLE, 0); err == nil {
+				lv.SendMessage(win.EM_SETBKGNDCOLOR, 0,
+					uintptr(win.GetSysColor(win.COLOR_WINDOW)))
+				// Cap total text so the 500-line history stays cheap.
+				lv.SendMessage(win.EM_EXLIMITTEXT, 0, uintptr(1<<20))
+				return lv, nil
+			}
+			// Adoption failed: destroy the orphan control and fall through.
+			win.DestroyWindow(hwnd)
 		}
 	}
 
-	if lv.hwnd != 0 {
-		// Handle() reports lv.hwnd, so InitWidget adopts the existing RichEdit
-		// control instead of creating a new window.
-		if err := walk.InitWidget(lv, parent, "", 0, 0); err == nil {
-			lv.SendMessage(win.EM_SETBKGNDCOLOR, 0,
-				uintptr(win.GetSysColor(win.COLOR_WINDOW)))
-			// Cap total text so the 500-line history stays cheap.
-			lv.SendMessage(win.EM_EXLIMITTEXT, 0, uintptr(1<<20))
-			return lv, nil
-		}
-		// Adoption failed: destroy the orphan control and fall through.
-		win.DestroyWindow(lv.hwnd)
-		lv.hwnd = 0
-	}
-
-	te, err := walk.NewTextEdit(parent)
-	if err != nil {
+	// RichEdit unavailable: fall back to a plain read-only multiline EDIT
+	// control; colourisation is skipped but the log stays visible.
+	if err := walk.InitWidget(
+		lv,
+		parent,
+		"EDIT",
+		win.WS_VISIBLE|win.WS_TABSTOP|win.WS_VSCROLL|win.ES_MULTILINE|win.ES_READONLY|win.ES_AUTOVSCROLL,
+		win.WS_EX_CLIENTEDGE); err != nil {
 		return nil, err
 	}
-	lv.fallback = te
-	_ = te.SetReadOnly(true)
 	return lv, nil
-}
-
-// Handle returns the underlying HWND. walk.InitWindow uses a non-zero result
-// to adopt the pre-created control rather than creating a new one.
-func (lv *logView) Handle() win.HWND {
-	if lv.fallback != nil {
-		return lv.fallback.Handle()
-	}
-	return lv.hwnd
 }
 
 // CreateLayoutItem implements walk.Widget; the log view greedily fills the
@@ -128,44 +116,19 @@ func (lv *logView) CreateLayoutItem(ctx *walk.LayoutContext) walk.LayoutItem {
 	return walk.NewGreedyLayoutItem()
 }
 
-// SetBoundsPixels keeps the adopted RichEdit control in sync with layout.
-func (lv *logView) SetBoundsPixels(bounds walk.Rectangle) error {
-	if lv.fallback != nil {
-		return lv.fallback.SetBoundsPixels(bounds)
-	}
-	return lv.WidgetBase.SetBoundsPixels(bounds)
-}
-
 // appendLines appends lines with per-severity colours and scrolls to the end.
 func (lv *logView) appendLines(lines []logLine) {
-	if lv.fallback != nil {
-		for _, l := range lines {
-			lv.fallback.AppendText(l.text + "\r\n")
-		}
-		lv.fallback.SendMessage(win.WM_VSCROLL, win.SB_BOTTOM, 0)
-		return
-	}
 	lv.SendMessage(win.WM_SETREDRAW, 0, 0)
 	for _, l := range lines {
 		lv.appendRichLine(l)
 	}
 	lv.scrollToEnd()
 	lv.SendMessage(win.WM_SETREDRAW, 1, 0)
-	win.InvalidateRect(lv.hwnd, nil, true)
+	win.InvalidateRect(lv.Handle(), nil, true)
 }
 
 // replaceLines re-renders the whole history (used when the cap trims lines).
 func (lv *logView) replaceLines(lines []logLine) {
-	if lv.fallback != nil {
-		var b strings.Builder
-		for _, l := range lines {
-			b.WriteString(l.text)
-			b.WriteString("\r\n")
-		}
-		_ = lv.fallback.SetText(b.String())
-		lv.fallback.SendMessage(win.WM_VSCROLL, win.SB_BOTTOM, 0)
-		return
-	}
 	lv.SendMessage(win.WM_SETREDRAW, 0, 0)
 	// Select everything and delete it.
 	lv.SendMessage(win.EM_SETSEL, 0, ^uintptr(0))
@@ -175,7 +138,7 @@ func (lv *logView) replaceLines(lines []logLine) {
 	}
 	lv.scrollToEnd()
 	lv.SendMessage(win.WM_SETREDRAW, 1, 0)
-	win.InvalidateRect(lv.hwnd, nil, true)
+	win.InvalidateRect(lv.Handle(), nil, true)
 }
 
 // scrollToEnd moves the caret/selection to the end and scrolls there.
