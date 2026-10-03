@@ -117,7 +117,7 @@ func (aw *appWindow) buildUI() error {
 	return (MainWindow{
 		AssignTo: &aw.MainWindow,
 		Name:     "SFTPSyncerMainWindow",
-		Title:    "SFTP Syncer v0.6.0",
+		Title:    "SFTP Syncer " + Version,
 		MinSize:  Size{Width: 860, Height: 620},
 		Size:     Size{Width: 1000, Height: 780},
 		Layout:   VBox{},
