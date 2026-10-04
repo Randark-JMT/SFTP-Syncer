@@ -31,9 +31,10 @@ const FILTER_LEVELS: Record<FilterKey, number[] | null> = {
 // 无主机前缀的日志（应用级消息）归入"系统消息"。
 const SYSTEM_FILTER = "__system__";
 
-// 同步器日志统一以"[主机标签] "开头，据此按主机筛选。
+// 日志行以 "[HH:MM:SS] " 开头，主机日志紧随其后是 "[主机标签] "。
+// 据此按主机筛选。
 function logHostLabel(text: string): string | null {
-  const m = /^\[([^\]]+)\]/.exec(text);
+  const m = /^\[\d{2}:\d{2}:\d{2}\] \[([^\]]+)\]/.exec(text);
   return m ? m[1] : null;
 }
 
