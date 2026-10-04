@@ -27,16 +27,13 @@ body,
   margin-right: 4px;
 }
 
-.app-body {
+.app-splitter {
   flex: 1;
   min-height: 0;
-  display: flex;
 }
 
 .app-sider {
-  width: 300px;
-  flex-shrink: 0;
-  border-right: 1px solid rgba(128, 128, 128, 0.2);
+  height: 100%;
   display: flex;
   flex-direction: column;
   padding: 12px;
@@ -45,45 +42,19 @@ body,
 }
 
 .app-content {
-  flex: 1;
+  height: 100%;
   min-width: 0;
+  min-height: 0;
   display: flex;
   flex-direction: column;
   padding: 12px 16px;
 }
 
-.app-tabs {
-  flex: 1;
-  min-height: 0;
+.app-logs {
+  height: 100%;
   display: flex;
   flex-direction: column;
-}
-
-.app-tabs .ant-tabs-content-holder {
-  flex: 1;
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
-}
-
-.app-tabs .ant-tabs-content {
-  flex: 1;
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
-}
-
-.app-tabs .ant-tabs-tabpane {
-  flex: 1;
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
-}
-
-/* 特异性必须高于上面的 .app-tabs .ant-tabs-tabpane（0-2-0），
-   否则 antd 的隐藏规则（0-1-0）被压掉，两个面板会同时显示。 */
-.app-tabs .ant-tabs-tabpane.ant-tabs-tabpane-hidden {
-  display: none;
+  padding: 8px 16px 12px;
 }
 
 .host-card {
@@ -146,4 +117,17 @@ body,
   gap: 8px;
   margin-bottom: 8px;
   flex-shrink: 0;
+}
+
+.table-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+  flex-shrink: 0;
+}
+
+.section-title {
+  font-size: 14px;
+  font-weight: 600;
 }

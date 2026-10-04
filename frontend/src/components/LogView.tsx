@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Button, Segmented, Tooltip } from "antd";
+import { Button, Segmented, Select, Tooltip } from "antd";
 import {
   ClearOutlined,
   VerticalAlignBottomOutlined,
@@ -9,6 +9,7 @@ import {
 import { api } from "../bindings";
 import { useAppStore } from "../store";
 import type { LogEntry } from "../types";
+import { hostDisplayName } from "../types";
 
 const LEVEL_CLASS: Record<number, string> = {
   0: "log-info",
@@ -27,19 +28,60 @@ const FILTER_LEVELS: Record<FilterKey, number[] | null> = {
   error: [3],
 };
 
+// 无主机前缀的日志（应用级消息）归入"系统消息"。
+const SYSTEM_FILTER = "__system__";
+
+// 同步器日志统一以"[主机标签] "开头，据此按主机筛选。
+function logHostLabel(text: string): string | null {
+  const m = /^\[([^\]]+)\]/.exec(text);
+  return m ? m[1] : null;
+}
+
 export default function LogView() {
   const logs = useAppStore((s) => s.logs);
+  const hosts = useAppStore((s) => s.hosts);
   const theme = useAppStore((s) => s.theme);
   const clearLogs = useAppStore((s) => s.clearLogs);
   const [filter, setFilter] = useState<FilterKey>("all");
+  const [hostFilter, setHostFilter] = useState<string>("all");
   const [autoScroll, setAutoScroll] = useState(true);
   const boxRef = useRef<HTMLDivElement>(null);
 
+  const hostLabelById = useMemo(() => {
+    const m = new Map<string, string>();
+    hosts.forEach((h) => {
+      if (h.id) m.set(h.id, hostDisplayName(h));
+    });
+    return m;
+  }, [hosts]);
+
+  const hostOptions = useMemo(
+    () => [
+      { value: "all", label: "全部主机" },
+      ...[...hostLabelById.entries()].map(([id, label]) => ({ value: id, label })),
+      { value: SYSTEM_FILTER, label: "系统消息" },
+    ],
+    [hostLabelById],
+  );
+
+  const effectiveFilter =
+    hostFilter !== "all" && hostFilter !== SYSTEM_FILTER && !hostLabelById.has(hostFilter)
+      ? "all"
+      : hostFilter;
+
   const visible = useMemo(() => {
     const levels = FILTER_LEVELS[filter];
-    if (!levels) return logs;
-    return logs.filter((l: LogEntry) => levels.includes(l.level));
-  }, [logs, filter]);
+    const knownLabels = new Set(hostLabelById.values());
+    return logs.filter((l: LogEntry) => {
+      if (levels && !levels.includes(l.level)) return false;
+      if (effectiveFilter === "all") return true;
+      const label = logHostLabel(l.text);
+      if (effectiveFilter === SYSTEM_FILTER) {
+        return label === null || !knownLabels.has(label);
+      }
+      return label === hostLabelById.get(effectiveFilter);
+    });
+  }, [logs, filter, effectiveFilter, hostLabelById]);
 
   useEffect(() => {
     if (autoScroll && boxRef.current) {
@@ -50,6 +92,13 @@ export default function LogView() {
   return (
     <div style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0 }}>
       <div className="log-toolbar">
+        <Select
+          size="small"
+          value={effectiveFilter}
+          onChange={setHostFilter}
+          options={hostOptions}
+          style={{ minWidth: 150 }}
+        />
         <Segmented
           value={filter}
           onChange={(v) => setFilter(v as FilterKey)}

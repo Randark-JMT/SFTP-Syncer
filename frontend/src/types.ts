@@ -19,6 +19,13 @@ export interface HostConfig {
 export const AUTH_PASSWORD = "password" as const;
 export const AUTH_PRIVATE_KEY = "private_key" as const;
 
+// 与 Go 侧 Config.DisplayName 保持一致。
+export function hostDisplayName(host: HostConfig): string {
+  if (host.name && host.name !== "") return host.name;
+  if (host.host === "") return "未命名主机";
+  return `${host.host}:${host.port}`;
+}
+
 export function emptyHostConfig(): HostConfig {
   return {
     name: "",

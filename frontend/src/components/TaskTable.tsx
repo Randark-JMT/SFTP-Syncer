@@ -1,7 +1,15 @@
-import { Empty, Progress, Table, Tag, Typography } from "antd";
+import { useMemo, useState } from "react";
+import { Empty, Progress, Select, Table, Tag, Typography } from "antd";
+import { CloudDownloadOutlined } from "@ant-design/icons";
 import type { ColumnsType } from "antd/es/table";
 import { useAppStore } from "../store";
-import { formatFileSize, taskStateLabel, type TaskEntry, type TaskState } from "../types";
+import {
+  formatFileSize,
+  hostDisplayName,
+  taskStateLabel,
+  type TaskEntry,
+  type TaskState,
+} from "../types";
 
 const STATE_TAG: Record<TaskState, { color: string; text: string }> = {
   pending: { color: "default", text: taskStateLabel.pending },
@@ -64,18 +72,73 @@ const columns: ColumnsType<TaskEntry> = [
 
 export default function TaskTable() {
   const tasks = useAppStore((s) => s.tasks);
+  const hosts = useAppStore((s) => s.hosts);
+  const [hostFilter, setHostFilter] = useState<string>("all");
 
-  if (tasks.length === 0) {
-    return (
-      <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center" }}>
-        <Empty description="当前没有下载任务" />
-      </div>
-    );
-  }
+  const hostOptions = useMemo(
+    () => [
+      { value: "all", label: "全部主机" },
+      ...hosts
+        .filter((h) => h.id)
+        .map((h) => ({ value: h.id as string, label: hostDisplayName(h) })),
+    ],
+    [hosts],
+  );
+
+  // 主机被删除后回退到"全部"。
+  const effectiveFilter =
+    hostFilter !== "all" && !hosts.some((h) => h.id === hostFilter) ? "all" : hostFilter;
+
+  const visible = useMemo(
+    () =>
+      effectiveFilter === "all"
+        ? tasks
+        : tasks.filter((t) => t.hostId === effectiveFilter),
+    [tasks, effectiveFilter],
+  );
 
   return (
-    <div style={{ flex: 1, minHeight: 0, overflow: "auto" }}>
-      <Table size="small" rowKey="key" columns={columns} dataSource={tasks} pagination={false} />
+    <div style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0 }}>
+      <div className="table-toolbar">
+        <span className="section-title">
+          <CloudDownloadOutlined /> 下载任务
+        </span>
+        {tasks.length > 0 && (
+          <Tag>
+            {visible.length}/{tasks.length}
+          </Tag>
+        )}
+        <div style={{ flex: 1 }} />
+        <Select
+          size="small"
+          value={effectiveFilter}
+          onChange={setHostFilter}
+          options={hostOptions}
+          style={{ minWidth: 160 }}
+        />
+      </div>
+      {visible.length === 0 ? (
+        <div
+          style={{
+            flex: 1,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+          }}
+        >
+          <Empty description="当前没有下载任务" />
+        </div>
+      ) : (
+        <div style={{ flex: 1, minHeight: 0, overflow: "auto" }}>
+          <Table
+            size="small"
+            rowKey="key"
+            columns={columns}
+            dataSource={visible}
+            pagination={false}
+          />
+        </div>
+      )}
     </div>
   );
 }

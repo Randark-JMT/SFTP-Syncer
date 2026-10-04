@@ -1,10 +1,9 @@
 import { useCallback, useEffect, useState } from "react";
-import { Layout, Tabs, Switch, Popover, Button, Space, Tag } from "antd";
+import { Layout, Switch, Popover, Button, Space, Splitter, Tag } from "antd";
 import {
   MoonOutlined,
   SunOutlined,
   QuestionCircleOutlined,
-  CloudDownloadOutlined,
 } from "@ant-design/icons";
 // @ts-ignore -- wailsjs 在 wails 构建时生成
 import { EventsOn } from "../wailsjs/runtime/runtime";
@@ -34,7 +33,6 @@ export default function App() {
   const setVersion = useAppStore((s) => s.setVersion);
   const hosts = useAppStore((s) => s.hosts);
   const statuses = useAppStore((s) => s.statuses);
-  const tasks = useAppStore((s) => s.tasks);
   const theme = useAppStore((s) => s.theme);
   const setTheme = useAppStore((s) => s.setTheme);
   const setStatuses = useAppStore((s) => s.setStatuses);
@@ -46,6 +44,9 @@ export default function App() {
 
   const [editing, setEditing] = useState<HostConfig | null>(null);
   const [drawerOpen, setDrawerOpen] = useState(false);
+  // 分割条初始尺寸：优先取上次拖拽结果。
+  const [initialSideSize] = useState(() => Number(localStorage.getItem("split-side")) || 300);
+  const [initialLogSize] = useState(() => Number(localStorage.getItem("split-logs")) || 260);
 
   const openAdd = useCallback(() => {
     setEditing(null);
@@ -118,36 +119,34 @@ export default function App() {
           </Space>
         </Layout.Header>
 
-        <Layout className="app-body">
-          <div className="app-sider">
-            <HostSidebar onAdd={openAdd} onEdit={openEdit} />
-          </div>
-          <div className="app-content">
-            <Tabs
-              className="app-tabs"
-              defaultActiveKey="tasks"
-              items={[
-                {
-                  key: "tasks",
-                  label: (
-                    <span>
-                      <CloudDownloadOutlined /> 下载任务
-                      {tasks.length > 0 && (
-                        <Tag style={{ marginLeft: 6 }}>{tasks.length}</Tag>
-                      )}
-                    </span>
-                  ),
-                  children: <TaskTable />,
-                },
-                {
-                  key: "logs",
-                  label: "运行日志",
-                  children: <LogView />,
-                },
-              ]}
-            />
-          </div>
-        </Layout>
+        <Splitter
+          className="app-splitter"
+          layout="vertical"
+          onResizeEnd={(sizes) => localStorage.setItem("split-logs", String(sizes[1]))}
+        >
+          <Splitter.Panel>
+            <Splitter
+              style={{ height: "100%" }}
+              onResizeEnd={(sizes) => localStorage.setItem("split-side", String(sizes[0]))}
+            >
+              <Splitter.Panel defaultSize={initialSideSize} min={220} max="45%">
+                <div className="app-sider">
+                  <HostSidebar onAdd={openAdd} onEdit={openEdit} />
+                </div>
+              </Splitter.Panel>
+              <Splitter.Panel min={320}>
+                <div className="app-content">
+                  <TaskTable />
+                </div>
+              </Splitter.Panel>
+            </Splitter>
+          </Splitter.Panel>
+          <Splitter.Panel defaultSize={initialLogSize} min={140} max="60%">
+            <div className="app-logs">
+              <LogView />
+            </div>
+          </Splitter.Panel>
+        </Splitter>
 
       <HostEditDrawer open={drawerOpen} initial={editing} onClose={closeDrawer} />
     </Layout>
