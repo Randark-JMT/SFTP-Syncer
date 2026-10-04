@@ -74,14 +74,8 @@ export default function TaskTable() {
   }
 
   return (
-    <Table
-      style={{ flex: 1, minHeight: 0 }}
-      size="small"
-      rowKey="key"
-      columns={columns}
-      dataSource={tasks}
-      pagination={false}
-      sticky
-    />
+    <div style={{ flex: 1, minHeight: 0, overflow: "auto" }}>
+      <Table size="small" rowKey="key" columns={columns} dataSource={tasks} pagination={false} />
+    </div>
   );
 }

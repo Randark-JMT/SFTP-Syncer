@@ -17,6 +17,7 @@ body,
   gap: 12px;
   padding: 0 16px;
   height: 48px;
+  line-height: normal;
   flex-shrink: 0;
 }
 
@@ -77,6 +78,12 @@ body,
   min-height: 0;
   display: flex;
   flex-direction: column;
+}
+
+/* 特异性必须高于上面的 .app-tabs .ant-tabs-tabpane（0-2-0），
+   否则 antd 的隐藏规则（0-1-0）被压掉，两个面板会同时显示。 */
+.app-tabs .ant-tabs-tabpane.ant-tabs-tabpane-hidden {
+  display: none;
 }
 
 .host-card {

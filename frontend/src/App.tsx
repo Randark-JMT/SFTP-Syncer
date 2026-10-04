@@ -93,9 +93,8 @@ export default function App() {
   const runningCount = hosts.filter((h) => h.id && statuses[h.id] && statuses[h.id] !== "已停止").length;
 
   return (
-    <div className="app-shell">
-      <Layout className="app-shell">
-        <Layout.Header className="app-header" style={{ background: "transparent" }}>
+    <Layout className="app-shell">
+      <Layout.Header className="app-header" style={{ background: "transparent" }}>
           <span className="app-title">SFTP Syncer</span>
           <Tag color="blue">{version}</Tag>
           {runningCount > 0 ? (
@@ -149,9 +148,8 @@ export default function App() {
             />
           </div>
         </Layout>
-      </Layout>
 
       <HostEditDrawer open={drawerOpen} initial={editing} onClose={closeDrawer} />
-    </div>
+    </Layout>
   );
 }
