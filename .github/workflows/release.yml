@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: '发布版本号（例如 v0.7.0，将覆盖默认版本并作为 Release 标签）'
+        description: '发布版本号（例如 v1.0.0，将覆盖默认版本并作为 Release 标签）'
         required: true
         type: string
       prerelease:
@@ -30,19 +30,22 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Generate Windows resource file
-        run: |
-          go run github.com/akavel/rsrc@latest -manifest app.manifest -arch amd64 -o rsrc_windows_amd64.syso
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Wails CLI
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@latest
 
       - name: Build SFTP-Syncer.exe
-        run: |
-          go build -ldflags="-H windowsgui -X main.Version=${{ inputs.version }}" -o SFTP-Syncer.exe .
+        run: wails build -tags desktop,production -ldflags "-X main.Version=${{ inputs.version }}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: SFTP-Syncer-${{ inputs.version }}-windows-amd64
-          path: SFTP-Syncer.exe
+          path: build/bin/SFTP-Syncer.exe
           if-no-files-found: error
 
       - name: Publish GitHub Release
@@ -52,4 +55,4 @@ jobs:
           name: SFTP Syncer ${{ inputs.version }}
           prerelease: ${{ inputs.prerelease }}
           generate_release_notes: true
-          files: SFTP-Syncer.exe
+          files: build/bin/SFTP-Syncer.exe

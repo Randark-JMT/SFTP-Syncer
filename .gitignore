@@ -5,6 +5,14 @@
 *.log
 *.out
 *.test
+*.png.tmp
 coverage.out
 bin/
 dist/
+build/bin/
+frontend/dist/
+frontend/node_modules/
+frontend/wailsjs/
+vendor/
+_boot_report.txt
+frontend/package.json.md5

@@ -1,0 +1,17 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "sftp-syncer",
+  "outputfilename": "SFTP-Syncer",
+  "frontend:install": "npm install",
+  "frontend:build": "npm run build",
+  "frontend:dev:watcher": "npm run dev",
+  "frontend:dev:serverUrl": "auto",
+  "author": {
+    "name": "Randark"
+  },
+  "info": {
+    "productName": "SFTP Syncer",
+    "productVersion": "1.0.0",
+    "comments": "SFTP 定时同步工具"
+  }
+}
