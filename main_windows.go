@@ -155,6 +155,7 @@ func (aw *appWindow) buildUI() error {
 			},
 			Label{AssignTo: &aw.statusLabel, Text: "状态：就绪"},
 			Label{Text: "同步规则：仅处理远程根目录下各子文件夹中的常规文件；根目录下的脚本、配置和其他散文件会被跳过。仅同步 UTC 修改时间早于当前时间 30 分钟的文件，下载后保留目录结构并删除远程源文件。"},
+			VSpacer{Size: 4},
 			VSplitter{
 				StretchFactor: 1,
 				Children: []Widget{
