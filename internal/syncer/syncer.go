@@ -59,15 +59,20 @@ const (
 	// 服务器实际支持的上限（SSH_FXP_READ 的 Len 字段为 uint32，OpenSSH
 	// 内部缓冲 256KB），配合更大的在途窗口可显著提高单文件速度。
 	sftpMaxPacket = 256 * 1024
-	// sftpMaxConcurrentRequests 是单个文件允许的在途读请求数上限。默认 64
-	// 搭配 32KB 包时窗口只有 2MB，无法填满高 BDP 链路；256 × 256KB 提供
-	// 最大 64MB 的在途窗口。
-	sftpMaxConcurrentRequests = 256
+	// sftpMaxConcurrentRequests 是单个文件允许的在途读请求数上限，作为
+	// 安全冗余设为下载窗口的两倍；实际在途请求由 downloadConcurrency
+	// 的滑动窗口约束，不会触及该上限。
+	sftpMaxConcurrentRequests = 64
 
-	// downloadChunkSize 是本地下载器单个 ReadAt 请求的读块大小。多个读块
-	// 通过若干并发 ReadAt 调用填满在途窗口（downloadConcurrency 决定上限）。
-	downloadChunkSize   = sftpMaxPacket
-	downloadConcurrency = sftpMaxConcurrentRequests
+	// downloadChunkSize 是本地下载器单个 ReadAt 请求的读块大小。
+	downloadChunkSize = sftpMaxPacket
+	// downloadConcurrency 是单个文件允许的在途读块数上限。下载器使用滑动
+	// 窗口：读块按序写盘后才释放窗口槽位，单文件内存占用被严格限制在
+	// downloadConcurrency × downloadChunkSize（32 × 256KB = 8MB），10 个
+	// Worker 同时下载约 80MB；旧实现 256 并发且乱序分块可无限堆积，10 个
+	// Worker 峰值可超过 1GB。8MB 在途窗口在 200ms RTT 下仍提供约 40MB/s
+	// 的单连接吞吐上限。
+	downloadConcurrency = 32
 )
 
 type Logger func(format string, args ...any)
@@ -826,6 +831,12 @@ func copyRemoteFile(ctx context.Context, src *sftp.File, dst io.Writer, size int
 	return copyWithContext(ctx, dst, src)
 }
 
+// chunkBufPool 复用下载读块缓冲，降低高吞吐下的 GC 压力。池内所有缓冲的
+// 长度均为 downloadChunkSize。
+var chunkBufPool = sync.Pool{
+	New: func() any { return make([]byte, downloadChunkSize) },
+}
+
 // copyRemoteFileConcurrent downloads exactly size bytes from src into dst
 // using bounded concurrent ReadAt calls (io.ReadFull semantics), writing the
 // chunks to dst strictly in offset order so dst needs no Seek. It is
@@ -848,71 +859,109 @@ func copyRemoteFileConcurrent(ctx context.Context, src io.ReadCloser, dst io.Wri
 		return 0, errors.New("reader does not support ReadAt")
 	}
 
-	type chunk struct {
-		data []byte
-		err  error
-	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
-	// results[i] receives chunk i. All channels are closed by their worker
-	// exactly once, so the writer can detect completion without extra
-	// synchronisation.
 	nChunks := int((size + downloadChunkSize - 1) / downloadChunkSize)
-	results := make([]chan chunk, nChunks)
-	for i := range results {
-		results[i] = make(chan chunk, 1)
+
+	type chunkResult struct {
+		index int
+		data  []byte
+		buf   []byte // 完整的池化缓冲，写盘后归还 chunkBufPool
+		err   error
 	}
 
-	go func() {
-		sem := make(chan struct{}, downloadConcurrency)
-		var wg sync.WaitGroup
-		for i := 0; i < nChunks; i++ {
-			off := int64(i) * downloadChunkSize
-			end := off + downloadChunkSize
-			if end > size {
-				end = size
-			}
-			buf := make([]byte, end-off)
-			sem <- struct{}{}
-			wg.Add(1)
-			go func(i int, off int64, buf []byte) {
-				defer wg.Done()
-				defer func() { <-sem }()
-				defer close(results[i])
-				n, err := readAtFull(ra, buf, off)
+	// 滑动窗口：window 统计"已派发但未写盘"的分块数，槽位只在分块写盘后
+	// 释放，因此内存占用被严格限制在 downloadConcurrency ×
+	// downloadChunkSize，不随文件大小增长；乱序完成的分块暂存于 backlog，
+	// 同样受窗口约束。
+	window := make(chan struct{}, downloadConcurrency)
+	jobs := make(chan int)
+	completed := make(chan chunkResult, downloadConcurrency)
+
+	var wg sync.WaitGroup
+	for range downloadConcurrency {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for index := range jobs {
+				if ctx.Err() != nil {
+					continue
+				}
+				off := int64(index) * downloadChunkSize
+				end := min(off+downloadChunkSize, size)
+				buf := chunkBufPool.Get().([]byte)
+				n, err := readAtFull(ra, buf[:end-off], off)
 				if err == nil {
 					err = ctx.Err()
 				}
 				if n > 0 && onReceive != nil {
 					onReceive(int64(n))
 				}
-				results[i] <- chunk{data: buf[:n], err: err}
-			}(i, off, buf)
+				select {
+				case completed <- chunkResult{index: index, data: buf[:n], buf: buf, err: err}:
+				case <-ctx.Done():
+					chunkBufPool.Put(buf)
+				}
+			}
+		}()
+	}
+
+	go func() {
+		defer close(jobs)
+		for i := 0; i < nChunks; i++ {
+			select {
+			case <-ctx.Done():
+				return
+			case window <- struct{}{}:
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case jobs <- i:
+			}
 		}
-		wg.Wait()
 	}()
 
+	backlog := make(map[int]chunkResult, downloadConcurrency)
 	written := int64(0)
-	for _, rc := range results {
-		c, ok := <-rc
-		if !ok {
-			// Worker exited without sending (shouldn't happen).
-			break
+	for next := 0; next < nChunks; {
+		var r chunkResult
+		select {
+		case <-ctx.Done():
+			return written, ctx.Err()
+		case r = <-completed:
 		}
-		if len(c.data) > 0 {
-			n, err := dst.Write(c.data)
-			written += int64(n)
-			if err != nil {
-				return written, err
+		backlog[r.index] = r
+		for {
+			rc, ok := backlog[next]
+			if !ok {
+				break
 			}
-			if n != len(c.data) {
-				return written, io.ErrShortWrite
+			delete(backlog, next)
+			<-window
+			if len(rc.data) > 0 {
+				n, err := dst.Write(rc.data)
+				written += int64(n)
+				if err != nil {
+					return written, err
+				}
+				if n != len(rc.data) {
+					return written, io.ErrShortWrite
+				}
 			}
-		}
-		if c.err != nil {
-			return written, c.err
+			chunkBufPool.Put(rc.buf)
+			if rc.err != nil {
+				if ctx.Err() != nil {
+					return written, ctx.Err()
+				}
+				return written, rc.err
+			}
+			next++
 		}
 	}
 
+	wg.Wait()
 	return written, ctx.Err()
 }
 

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -282,6 +283,79 @@ func TestProgressTrackerThrottlesAndCounts(t *testing.T) {
 	pt.add(25)
 	if updates != 2 || lastReceived != 175 {
 		t.Fatalf("expected cumulative 175, got updates=%d received=%d", updates, lastReceived)
+	}
+}
+
+// blockingReadAt 让偏移 0 处的读块阻塞，直到测试放行，用于验证滑动窗口对
+// 读超前的约束。
+type blockingReadAt struct {
+	data    []byte
+	entered chan struct{} // 首个读块进入时关闭
+	release chan struct{} // 关闭后放行阻塞的读块
+	started *atomic.Int32
+}
+
+func (b *blockingReadAt) ReadAt(p []byte, off int64) (int, error) {
+	b.started.Add(1)
+	if off == 0 {
+		select {
+		case <-b.entered:
+		default:
+			close(b.entered)
+		}
+		<-b.release
+	}
+	n := len(p)
+	if rem := int64(len(b.data)) - off; int64(n) > rem {
+		n = int(rem)
+	}
+	copy(p, b.data[off:off+int64(n)])
+	if n < len(p) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+func (b *blockingReadAt) Read(p []byte) (int, error) { return 0, io.EOF }
+func (b *blockingReadAt) Close() error               { return nil }
+
+func TestCopyRemoteFileConcurrentBoundsReadAhead(t *testing.T) {
+	size := int64(downloadChunkSize * (downloadConcurrency + 4))
+	data := make([]byte, size)
+	var started atomic.Int32
+	src := &blockingReadAt{
+		data:    data,
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+		started: &started,
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := copyRemoteFileConcurrent(context.Background(), src, io.Discard, size, nil)
+		done <- err
+	}()
+
+	<-src.entered
+	// 等待读请求数稳定：窗口填满后写盘被阻塞的首块卡住，不应再有新读块
+	// 派发。旧实现不受写盘进度约束，会把整个文件的读块全部派发出去。
+	prev := int32(-1)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		cur := started.Load()
+		if cur > 0 && cur == prev {
+			break
+		}
+		prev = cur
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := started.Load(); got > int32(downloadConcurrency) {
+		t.Fatalf("read-ahead is not bounded: %d reads started, window is %d", got, downloadConcurrency)
+	}
+
+	close(src.release)
+	if err := <-done; err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
