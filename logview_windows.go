@@ -67,6 +67,13 @@ type logView struct {
 	walk.WidgetBase
 	textColor win.COLORREF
 	isRich    bool
+
+	// selLen is the total character count in EM_SETSEL coordinates: RichEdit
+	// normalises each CRLF to a single paragraph-mark character, while the
+	// plain EDIT (and WM_GETTEXTLENGTH) count two. Formatting ranges must use
+	// the control's own indexing, so the cursor is tracked here instead of
+	// asking the control.
+	selLen int
 }
 
 // newLogView creates the widget under parent. It returns an error only when
@@ -136,6 +143,7 @@ func (lv *logView) replaceLines(lines []logLine) {
 	// Select everything and delete it.
 	lv.SendMessage(win.EM_SETSEL, 0, ^uintptr(0))
 	lv.SendMessage(win.EM_REPLACESEL, 0, uintptr(unsafe.Pointer(emptyStringPtr())))
+	lv.selLen = 0
 	for _, l := range lines {
 		lv.appendRichLine(l)
 	}
@@ -158,15 +166,24 @@ func (lv *logView) scrollToEnd() {
 // Colouring formats the freshly inserted character range: setting the
 // character format at a collapsed insertion point (SCF_SELECTION on an empty
 // selection) only reliably affects later typing when the control has focus,
-// whereas formatting an actual selection works unconditionally.
+// whereas formatting an actual selection works unconditionally. The range is
+// tracked in selLen (EM_SETSEL coordinates), NOT via WM_GETTEXTLENGTH: for
+// RichEdit the two disagree by one character per line (CRLF vs one paragraph
+// mark), which accumulates into a whole-line colour drift as the log grows.
 func (lv *logView) appendRichLine(l logLine) {
-	start := lv.SendMessage(win.WM_GETTEXTLENGTH, 0, 0)
+	chars := len([]rune(l.text))
+	eol := 2
+	if lv.isRich {
+		eol = 1
+	}
+
+	start := uintptr(lv.selLen)
 	end := uintptr(0x7FFFFFFF)
 	lv.SendMessage(win.EM_SETSEL, end, end)
 	if text, err := windows.UTF16FromString(l.text + "\r\n"); err == nil {
 		lv.SendMessage(win.EM_REPLACESEL, 0, uintptr(unsafe.Pointer(&text[0])))
 	}
-	finish := lv.SendMessage(win.WM_GETTEXTLENGTH, 0, 0)
+	lv.selLen += chars + eol
 
 	color, ok := logLevelColors[l.level]
 	if !ok {
@@ -177,7 +194,7 @@ func (lv *logView) appendRichLine(l logLine) {
 		DwMask:      win.CFM_COLOR,
 		CrTextColor: color,
 	}
-	lv.SendMessage(win.EM_SETSEL, start, finish)
+	lv.SendMessage(win.EM_SETSEL, start, uintptr(lv.selLen-eol))
 	lv.SendMessage(win.EM_SETCHARFORMAT, win.SCF_SELECTION, uintptr(unsafe.Pointer(&cf)))
 }
 
