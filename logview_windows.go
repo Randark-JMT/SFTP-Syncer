@@ -56,13 +56,17 @@ var logLevelColors = map[logLevel]win.COLORREF{
 var msfteditDLL = windows.NewLazySystemDLL("msftedit.dll")
 
 // logView is a read-only, colourised log widget backed by RichEdit
-// (MSFTEDIT_CLASS, "RICHEDIT50W", present since Windows XP SP1). The control
-// HWND is created directly; walk.InitWidget then adopts it into the widget
-// tree by subclassing its WndProc. If the RichEdit class is unavailable the
-// widget degrades to a plain EDIT control so the app stays usable.
+// (MSFTEDIT_CLASS, "RICHEDIT50W", registered by msftedit.dll; present since
+// Windows XP SP1). The control is created *through* walk.InitWidget by passing
+// the RichEdit class name — walk cannot adopt a pre-created HWND, its
+// InitWidget always calls CreateWindowEx itself, so manual creation followed
+// by "adoption" silently fails. If msftedit.dll is unavailable the widget
+// degrades to a plain read-only EDIT control: colourisation is skipped, but
+// the log stays visible.
 type logView struct {
 	walk.WidgetBase
 	textColor win.COLORREF
+	isRich    bool
 }
 
 // newLogView creates the widget under parent. It returns an error only when
@@ -71,43 +75,39 @@ func newLogView(parent walk.Container) (*logView, error) {
 	lv := &logView{}
 	lv.textColor = win.COLORREF(win.GetSysColor(win.COLOR_WINDOWTEXT))
 
-	if err := msfteditDLL.Load(); err == nil {
-		hwnd := win.CreateWindowEx(
-			win.WS_EX_CLIENTEDGE,
-			windows.StringToUTF16Ptr(win.MSFTEDIT_CLASS),
-			nil,
-			win.WS_CHILD|win.WS_VISIBLE|win.WS_TABSTOP|win.WS_VSCROLL|
-				win.ES_MULTILINE|win.ES_READONLY|win.ES_AUTOVSCROLL|win.ES_NOHIDESEL,
-			0, 0, 0, 0,
-			parent.Handle(), 0, 0, nil,
-		)
-		if hwnd != 0 {
-			// Handle() reports the pre-created HWND, so InitWidget adopts it
-			// instead of creating a new window. WS_VISIBLE must be passed so
-			// walk marks the widget visible and includes it in layout.
-			if err := walk.InitWidget(lv, parent, "", win.WS_VISIBLE, 0); err == nil {
-				lv.SendMessage(win.EM_SETBKGNDCOLOR, 0,
-					uintptr(win.GetSysColor(win.COLOR_WINDOW)))
-				// Cap total text so the 500-line history stays cheap.
-				lv.SendMessage(win.EM_EXLIMITTEXT, 0, uintptr(1<<20))
-				return lv, nil
-			}
-			// Adoption failed: destroy the orphan control and fall through.
-			win.DestroyWindow(hwnd)
-		}
+	className := "EDIT"
+	if msfteditDLL.Load() == nil {
+		className = win.MSFTEDIT_CLASS
+		lv.isRich = true
 	}
 
-	// RichEdit unavailable: fall back to a plain read-only multiline EDIT
-	// control; colourisation is skipped but the log stays visible.
 	if err := walk.InitWidget(
 		lv,
 		parent,
-		"EDIT",
-		win.WS_VISIBLE|win.WS_TABSTOP|win.WS_VSCROLL|win.ES_MULTILINE|win.ES_READONLY|win.ES_AUTOVSCROLL,
+		className,
+		win.WS_VISIBLE|win.WS_TABSTOP|win.WS_VSCROLL|
+			win.ES_MULTILINE|win.ES_READONLY|win.ES_AUTOVSCROLL|win.ES_NOHIDESEL,
 		win.WS_EX_CLIENTEDGE); err != nil {
 		return nil, err
 	}
+
+	if lv.isRich {
+		lv.SendMessage(win.EM_SETBKGNDCOLOR, 0,
+			uintptr(win.GetSysColor(win.COLOR_WINDOW)))
+		// Cap total text so the 500-line history stays cheap.
+		lv.SendMessage(win.EM_EXLIMITTEXT, 0, uintptr(1<<20))
+	}
 	return lv, nil
+}
+
+// WndProc repairs the fallback EDIT's formatting rectangle on resize. Plain
+// EDIT controls stop tracking size changes once updates were suspended with
+// WM_SETREDRAW, leaving text wrapped to a stale width.
+func (lv *logView) WndProc(hwnd win.HWND, msg uint32, wParam, lParam uintptr) uintptr {
+	if msg == win.WM_SIZE && !lv.isRich {
+		lv.repairFormatRect()
+	}
+	return lv.WidgetBase.WndProc(hwnd, msg, wParam, lParam)
 }
 
 // CreateLayoutItem implements walk.Widget; the log view greedily fills the
@@ -124,6 +124,9 @@ func (lv *logView) appendLines(lines []logLine) {
 	}
 	lv.scrollToEnd()
 	lv.SendMessage(win.WM_SETREDRAW, 1, 0)
+	if !lv.isRich {
+		lv.repairFormatRect()
+	}
 	win.InvalidateRect(lv.Handle(), nil, true)
 }
 
@@ -138,6 +141,9 @@ func (lv *logView) replaceLines(lines []logLine) {
 	}
 	lv.scrollToEnd()
 	lv.SendMessage(win.WM_SETREDRAW, 1, 0)
+	if !lv.isRich {
+		lv.repairFormatRect()
+	}
 	win.InvalidateRect(lv.Handle(), nil, true)
 }
 
@@ -149,12 +155,18 @@ func (lv *logView) scrollToEnd() {
 }
 
 // appendRichLine appends one line at the end with the level's colour.
+// Colouring formats the freshly inserted character range: setting the
+// character format at a collapsed insertion point (SCF_SELECTION on an empty
+// selection) only reliably affects later typing when the control has focus,
+// whereas formatting an actual selection works unconditionally.
 func (lv *logView) appendRichLine(l logLine) {
-	// Move the insertion point to the very end (INT_MAX, not -1: for RichEdit
-	// EM_SETSEL, both -1 and INT_MAX mean "end", but -1 with a selection can
-	// be misread; INT_MAX is unambiguous).
+	start := lv.SendMessage(win.WM_GETTEXTLENGTH, 0, 0)
 	end := uintptr(0x7FFFFFFF)
 	lv.SendMessage(win.EM_SETSEL, end, end)
+	if text, err := windows.UTF16FromString(l.text + "\r\n"); err == nil {
+		lv.SendMessage(win.EM_REPLACESEL, 0, uintptr(unsafe.Pointer(&text[0])))
+	}
+	finish := lv.SendMessage(win.WM_GETTEXTLENGTH, 0, 0)
 
 	color, ok := logLevelColors[l.level]
 	if !ok {
@@ -165,15 +177,24 @@ func (lv *logView) appendRichLine(l logLine) {
 		DwMask:      win.CFM_COLOR,
 		CrTextColor: color,
 	}
+	lv.SendMessage(win.EM_SETSEL, start, finish)
 	lv.SendMessage(win.EM_SETCHARFORMAT, win.SCF_SELECTION, uintptr(unsafe.Pointer(&cf)))
+}
 
-	if text, err := windows.UTF16FromString(l.text + "\r\n"); err == nil {
-		lv.SendMessage(win.EM_REPLACESEL, 0, uintptr(unsafe.Pointer(&text[0])))
+// repairFormatRect resets the fallback EDIT's formatting rectangle to the
+// current client area (inset by the control's own margins). Needed after the
+// WM_SETREDRAW suspend/resume around batch appends, which leaves the plain
+// EDIT wrapping text at a stale width. Only the fallback path invokes it;
+// RichEdit tracks resizes correctly on its own.
+func (lv *logView) repairFormatRect() {
+	var rc win.RECT
+	if !win.GetClientRect(lv.Handle(), &rc) {
+		return
 	}
-
-	// Reset to the default colour so later uncoloured output stays neutral.
-	cf.CrTextColor = lv.textColor
-	lv.SendMessage(win.EM_SETCHARFORMAT, win.SCF_SELECTION, uintptr(unsafe.Pointer(&cf)))
+	margins := lv.SendMessage(win.EM_GETMARGINS, 0, 0)
+	rc.Left = int32(margins & 0xFFFF)
+	rc.Right -= int32((margins >> 16) & 0xFFFF)
+	lv.SendMessage(win.EM_SETRECT, 0, uintptr(unsafe.Pointer(&rc)))
 }
 
 var emptyUTF16 = []uint16{0}
