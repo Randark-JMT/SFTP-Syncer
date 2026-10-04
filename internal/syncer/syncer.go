@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -29,6 +30,26 @@ const (
 	// 为 10 条并发传输，这里对齐以充分利用带宽。
 	maxDownloadWorkers = 10
 	workerCooldown     = 10 * time.Second
+)
+
+const (
+	// keepaliveInterval / keepaliveTimeout 控制池化连接的 SSH keepalive：
+	// 既防止 NAT/防火墙因空闲断开连接，也在对端失联时于有限时间内关闭
+	// 连接，避免传输阻塞到 TCP 重传超时（可能长达数分钟），期间任务在
+	// 前端只会显示"下载中"但毫无进展。
+	keepaliveInterval = 15 * time.Second
+	keepaliveTimeout  = 10 * time.Second
+
+	// probeIdleThreshold 是复用池化连接前需要探活的空闲时长阈值；短于该
+	// 阈值的连接由 keepalive 担保活性，直接复用。probeTimeout 是探活请求
+	// 的硬超时，超时即关闭旧连接并重新拨号。
+	probeIdleThreshold = 30 * time.Second
+	probeTimeout       = 5 * time.Second
+
+	// downloadStallTimeout 是下载停滞看门狗的触发时长：TCP 层存活但服务器
+	// 不再发送数据时 keepalive 无法察觉，超过该时长没有任何字节到达即主动
+	// 中止传输，任务标记失败并交由下一轮轮询重试。
+	downloadStallTimeout = 2 * time.Minute
 )
 
 const (
@@ -124,16 +145,24 @@ type poolWorker struct {
 	conn      *ssh.Client
 	client    *sftp.Client
 	coolUntil time.Time
+
+	// lastUsed 是池化连接最近一次成功使用的时间，connect 据此决定复用前
+	// 是否需要探活。dead 由 keepalive 协程在对端失联时置位。stopKeepalive
+	// 停止当前连接的 keepalive 协程，随 disconnect 清理。
+	lastUsed      time.Time
+	dead          atomic.Bool
+	stopKeepalive func()
 }
 
 // ProgressState is the lifecycle state of a single file download task.
 type ProgressState string
 
 const (
-	ProgressStatePending ProgressState = "pending"
-	ProgressStateActive  ProgressState = "active"
-	ProgressStateDone    ProgressState = "done"
-	ProgressStateFailed  ProgressState = "failed"
+	ProgressStatePending    ProgressState = "pending"
+	ProgressStateConnecting ProgressState = "connecting"
+	ProgressStateActive     ProgressState = "active"
+	ProgressStateDone       ProgressState = "done"
+	ProgressStateFailed     ProgressState = "failed"
 )
 
 // ProgressEvent carries per-file progress information to the caller.
@@ -218,6 +247,11 @@ func (s *Service) RunOnce(ctx context.Context, cfg config.Config) (Result, error
 		return Result{}, fmt.Errorf("SSH 连接失败: %w", err)
 	}
 	defer conn.Close()
+
+	// 下载阶段扫描连接会长时间空闲，启用 keepalive 防止被对端静默断开后
+	// 下一轮遍历长时间阻塞。
+	stopKeepalive := startSSHKeepalive(conn, nil)
+	defer stopKeepalive()
 
 	client, err := s.newSFTPClient(conn)
 	if err != nil {
@@ -414,10 +448,17 @@ func (w *poolWorker) run(ctx context.Context, queue <-chan workerTask) {
 	}
 }
 
+// connect 返回一条可用的 SFTP 连接：池化连接仍然可用时直接复用（空闲较久
+// 先探活，keepalive 已判定失联则直接重连），否则重新拨号并为新连接启动
+// keepalive。
 func (w *poolWorker) connect() error {
-	if w.client != nil {
-		return nil
+	if w.client != nil && !w.dead.Load() {
+		if time.Since(w.lastUsed) < probeIdleThreshold || w.probe() {
+			return nil
+		}
 	}
+	w.disconnect()
+
 	conn, err := ssh.Dial("tcp", w.addr, w.sshConfig)
 	if err != nil {
 		return fmt.Errorf("SSH 连接失败: %w", err)
@@ -429,11 +470,42 @@ func (w *poolWorker) connect() error {
 	}
 	w.conn = conn
 	w.client = client
+	w.dead.Store(false)
+	w.lastUsed = time.Now()
+	w.stopKeepalive = startSSHKeepalive(conn, func() { w.dead.Store(true) })
 	w.service.logf("Worker %d 已建立 SFTP 连接。", w.id+1)
 	return nil
 }
 
+// probe 用一次 Stat 往返确认池化连接仍然可用。probeTimeout 超时即关闭底层
+// 连接，使阻塞中的请求立即返回错误，而不是挂到 TCP 重传超时。
+func (w *poolWorker) probe() bool {
+	client, conn := w.client, w.conn
+	done := make(chan error, 1)
+	go func() {
+		_, err := client.Stat(".")
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			w.service.logf("Worker %d 池化连接探活失败，重新连接: %v", w.id+1, err)
+			return false
+		}
+		return true
+	case <-time.After(probeTimeout):
+		w.service.logf("Worker %d 池化连接探活超时，重新连接。", w.id+1)
+		_ = conn.Close()
+		<-done
+		return false
+	}
+}
+
 func (w *poolWorker) disconnect() {
+	if w.stopKeepalive != nil {
+		w.stopKeepalive()
+		w.stopKeepalive = nil
+	}
 	if w.client != nil {
 		_ = w.client.Close()
 		w.client = nil
@@ -442,6 +514,47 @@ func (w *poolWorker) disconnect() {
 		_ = w.conn.Close()
 		w.conn = nil
 	}
+}
+
+// startSSHKeepalive 每隔 keepaliveInterval 发送一次 SSH keepalive 全局请求，
+// 保持 NAT 会话存活；对端超过 keepaliveTimeout 未应答时主动关闭连接，让阻塞
+// 中的 SFTP 请求快速失败而不是挂到 TCP 超时。onDead 在关闭连接前调用，可为
+// nil。返回的 stop 函数用于停止 keepalive 协程。
+func startSSHKeepalive(conn *ssh.Client, onDead func()) (stop func()) {
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(keepaliveInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+			}
+
+			errCh := make(chan error, 1)
+			go func() {
+				_, _, err := conn.SendRequest("keepalive@openssh.com", true, nil)
+				errCh <- err
+			}()
+			select {
+			case <-done:
+				return
+			case err := <-errCh:
+				if err == nil {
+					continue
+				}
+			case <-time.After(keepaliveTimeout):
+			}
+
+			if onDead != nil {
+				onDead()
+			}
+			_ = conn.Close()
+			return
+		}
+	}()
+	return func() { close(done) }
 }
 
 func (w *poolWorker) enterCooldown() {
@@ -465,7 +578,9 @@ func (w *poolWorker) executeTask(ctx context.Context, task workerTask) {
 		return
 	}
 
-	w.service.notifyProgress(ProgressEvent{RemotePath: dl.remotePath, State: ProgressStateActive, Total: dl.info.Size()})
+	// 拨号/探活可能耗时数秒，先标记"连接中"，避免任务在尚未开始传输时就
+	// 显示"下载中"却长期零进度。
+	w.service.notifyProgress(ProgressEvent{RemotePath: dl.remotePath, State: ProgressStateConnecting, Total: dl.info.Size()})
 
 	if err := w.connect(); err != nil {
 		w.service.logError("Worker %d 连接失败，进入冷却（%s）: %v", w.id+1, dl.remotePath, err)
@@ -474,6 +589,8 @@ func (w *poolWorker) executeTask(ctx context.Context, task workerTask) {
 		task.result <- downloadOutcome{}
 		return
 	}
+
+	w.service.notifyProgress(ProgressEvent{RemotePath: dl.remotePath, State: ProgressStateActive, Total: dl.info.Size()})
 
 	if err := w.service.downloadFile(ctx, w.client, dl.remotePath, dl.localPath, dl.info); err != nil {
 		if errors.Is(err, context.Canceled) {
@@ -486,6 +603,8 @@ func (w *poolWorker) executeTask(ctx context.Context, task workerTask) {
 		task.result <- downloadOutcome{}
 		return
 	}
+
+	w.lastUsed = time.Now()
 
 	outcome := downloadOutcome{downloaded: true}
 	if err := w.client.Remove(dl.remotePath); err != nil {
@@ -596,23 +715,55 @@ func (s *Service) downloadFile(ctx context.Context, client *sftp.Client, remoteP
 	}
 	s.logf("开始下载: %s -> %s (%d 字节)", remotePath, localPath, expectSize)
 
-	pw := &progressWriter{
-		Writer:   localFile,
+	// 停滞看门狗：TCP 层存活但服务器不再发数据时 keepalive 无法察觉，这里
+	// 在长时间零字节后取消 stallCtx 中止传输，让任务快速失败并交由下一轮
+	// 轮询重试，而不是无限期挂起。
+	stallCtx, cancelStall := context.WithCancel(ctx)
+	defer cancelStall()
+
+	tracker := &progressTracker{
 		lastTime: time.Now(),
-		onUpdate: func(downloaded int64, speedBps float64) {
+		onUpdate: func(received int64, speedBps float64) {
 			s.notifyProgress(ProgressEvent{
 				RemotePath: remotePath,
 				State:      ProgressStateActive,
-				Downloaded: downloaded,
+				Downloaded: received,
 				Total:      expectSize,
 				SpeedBps:   speedBps,
 			})
 		},
 	}
+	tracker.lastActivity.Store(time.Now().UnixNano())
 
-	copied, copyErr := copyRemoteFile(ctx, remoteFile, pw, expectSize)
+	watchdogDone := make(chan struct{})
+	defer close(watchdogDone)
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-watchdogDone:
+				return
+			case <-stallCtx.Done():
+				return
+			case <-ticker.C:
+				if time.Since(time.Unix(0, tracker.lastActivity.Load())) > downloadStallTimeout {
+					s.logWarn("下载停滞超过 %v，中止传输: %s", downloadStallTimeout, remotePath)
+					cancelStall()
+					return
+				}
+			}
+		}
+	}()
+
+	copied, copyErr := copyRemoteFile(stallCtx, remoteFile, localFile, expectSize, tracker.add)
 	closeErr := localFile.Close()
 	if copyErr != nil {
+		if errors.Is(copyErr, context.Canceled) && ctx.Err() == nil {
+			// 非用户取消，而是停滞看门狗触发：换成明确的错误，避免被上层
+			// 误判为用户取消而静默跳过。
+			copyErr = fmt.Errorf("下载停滞超过 %v 无进展", downloadStallTimeout)
+		}
 		_ = os.Remove(tempPath)
 		return copyErr
 	}
@@ -654,9 +805,9 @@ func (s *Service) downloadFile(ctx context.Context, client *sftp.Client, remoteP
 // treats any short SFTP read as io.EOF. SFTP READ replies are message-based
 // and may legitimately return fewer bytes than requested; some servers do so
 // under load. readAtFull closes that gap with io.ReadFull semantics.
-func copyRemoteFile(ctx context.Context, src *sftp.File, dst io.Writer, size int64) (int64, error) {
+func copyRemoteFile(ctx context.Context, src *sftp.File, dst io.Writer, size int64, onReceive func(int64)) (int64, error) {
 	if size > 0 {
-		written, err := copyRemoteFileConcurrent(ctx, src, dst, size)
+		written, err := copyRemoteFileConcurrent(ctx, src, dst, size, onReceive)
 		if err != nil {
 			return 0, err
 		}
@@ -669,6 +820,9 @@ func copyRemoteFile(ctx context.Context, src *sftp.File, dst io.Writer, size int
 			return 0, err
 		}
 	}
+	if onReceive != nil {
+		dst = &receiveWriter{Writer: dst, onReceive: onReceive}
+	}
 	return copyWithContext(ctx, dst, src)
 }
 
@@ -677,7 +831,10 @@ func copyRemoteFile(ctx context.Context, src *sftp.File, dst io.Writer, size int
 // chunks to dst strictly in offset order so dst needs no Seek. It is
 // cancellation-aware via ctx: on cancellation the reader is closed, which
 // aborts the in-flight SFTP requests, and context.Canceled is returned.
-func copyRemoteFileConcurrent(ctx context.Context, src io.ReadCloser, dst io.Writer, size int64) (int64, error) {
+//
+// onReceive（可为 nil）在每个分块从网络到达时按实际收到的字节数回调；分块
+// 乱序完成，回调顺序与文件偏移无关，调用方需自行保证并发安全。
+func copyRemoteFileConcurrent(ctx context.Context, src io.ReadCloser, dst io.Writer, size int64, onReceive func(int64)) (int64, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
@@ -724,6 +881,9 @@ func copyRemoteFileConcurrent(ctx context.Context, src io.ReadCloser, dst io.Wri
 				n, err := readAtFull(ra, buf, off)
 				if err == nil {
 					err = ctx.Err()
+				}
+				if n > 0 && onReceive != nil {
+					onReceive(int64(n))
 				}
 				results[i] <- chunk{data: buf[:n], err: err}
 			}(i, off, buf)
@@ -845,25 +1005,49 @@ func copyWithContext(ctx context.Context, dst io.Writer, src io.Reader) (int64, 
 	}
 }
 
-// progressWriter wraps an io.Writer and calls onUpdate with byte count and speed
-// at most once every 250 ms so callers are not flooded with callbacks.
-type progressWriter struct {
-	io.Writer
-	downloaded int64
-	lastBytes  int64
-	lastTime   time.Time
-	onUpdate   func(downloaded int64, speedBps float64)
+// progressTracker 按"已从网络收到的字节数"统计进度，而不是按写入磁盘的顺序
+// 统计：并发下载时后偏移的分块可能先落在内存里，按写盘顺序统计会让进度条
+// 长时间停在 0 再猛跳，看起来像"卡住很久才开始"。onUpdate 最多每 250ms 触发
+// 一次。add 可被多个分块协程并发调用。
+type progressTracker struct {
+	mu        sync.Mutex
+	received  int64
+	lastBytes int64
+	lastTime  time.Time
+	onUpdate  func(received int64, speedBps float64)
+
+	// lastActivity 记录最近一次收到字节的时间（UnixNano），供停滞看门狗
+	// 判断传输是否还活着。
+	lastActivity atomic.Int64
 }
 
-func (pw *progressWriter) Write(p []byte) (int, error) {
-	n, err := pw.Writer.Write(p)
-	pw.downloaded += int64(n)
+func (pt *progressTracker) add(n int64) {
+	if n <= 0 {
+		return
+	}
+	pt.lastActivity.Store(time.Now().UnixNano())
+	pt.mu.Lock()
+	defer pt.mu.Unlock()
+	pt.received += n
 	now := time.Now()
-	if elapsed := now.Sub(pw.lastTime); elapsed >= 250*time.Millisecond {
-		delta := pw.downloaded - pw.lastBytes
-		pw.onUpdate(pw.downloaded, float64(delta)/elapsed.Seconds())
-		pw.lastBytes = pw.downloaded
-		pw.lastTime = now
+	if elapsed := now.Sub(pt.lastTime); elapsed >= 250*time.Millisecond {
+		delta := pt.received - pt.lastBytes
+		pt.onUpdate(pt.received, float64(delta)/elapsed.Seconds())
+		pt.lastBytes = pt.received
+		pt.lastTime = now
+	}
+}
+
+// receiveWriter 把顺序拷贝路径的字节数桥接到 onReceive 回调。
+type receiveWriter struct {
+	io.Writer
+	onReceive func(int64)
+}
+
+func (rw *receiveWriter) Write(p []byte) (int, error) {
+	n, err := rw.Writer.Write(p)
+	if n > 0 {
+		rw.onReceive(int64(n))
 	}
 	return n, err
 }

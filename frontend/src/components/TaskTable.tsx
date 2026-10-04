@@ -13,6 +13,7 @@ import {
 
 const STATE_TAG: Record<TaskState, { color: string; text: string }> = {
   pending: { color: "default", text: taskStateLabel.pending },
+  connecting: { color: "gold", text: taskStateLabel.connecting },
   active: { color: "processing", text: taskStateLabel.active },
   done: { color: "success", text: taskStateLabel.done },
   failed: { color: "error", text: taskStateLabel.failed },
@@ -56,7 +57,7 @@ const columns: ColumnsType<TaskEntry> = [
         <Progress
           percent={pct}
           size="small"
-          status={row.state === "failed" ? "exception" : row.state === "pending" ? "normal" : "active"}
+          status={row.state === "failed" ? "exception" : row.state === "pending" || row.state === "connecting" ? "normal" : "active"}
           format={() => `${formatFileSize(row.downloaded)} / ${formatFileSize(row.total)}`}
         />
       );

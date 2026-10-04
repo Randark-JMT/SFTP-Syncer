@@ -50,7 +50,7 @@ export interface LogEntry {
   text: string;
 }
 
-export type TaskState = "pending" | "active" | "done" | "failed";
+export type TaskState = "pending" | "connecting" | "active" | "done" | "failed";
 
 export interface ProgressEvent {
   hostId: string;
@@ -86,6 +86,7 @@ export function formatFileSize(bytes: number): string {
 
 export const taskStateLabel: Record<TaskState, string> = {
   pending: "待执行",
+  connecting: "连接中",
   active: "下载中",
   done: "已完成",
   failed: "失败",

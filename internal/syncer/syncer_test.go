@@ -206,7 +206,7 @@ func TestCopyRemoteFileConcurrentWritesInOrder(t *testing.T) {
 	src := &shortReadAt{data: data, max: 7 * 1024}
 	var dst bytes.Buffer
 
-	written, err := copyRemoteFileConcurrent(context.Background(), src, &dst, int64(size))
+	written, err := copyRemoteFileConcurrent(context.Background(), src, &dst, int64(size), nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -218,6 +218,33 @@ func TestCopyRemoteFileConcurrentWritesInOrder(t *testing.T) {
 	}
 }
 
+func TestCopyRemoteFileConcurrentReportsReceiveProgress(t *testing.T) {
+	// 进度回调按"已收到字节"统计：所有分块汇报的字节总和必须等于文件
+	// 大小，与分块完成顺序无关。
+	size := 300 * 1024
+	data := make([]byte, size)
+	src := &shortReadAt{data: data, max: 7 * 1024}
+
+	var mu sync.Mutex
+	var received int64
+	var calls int
+	_, err := copyRemoteFileConcurrent(context.Background(), src, io.Discard, int64(size), func(n int64) {
+		mu.Lock()
+		received += n
+		calls++
+		mu.Unlock()
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if received != int64(size) {
+		t.Fatalf("expected %d received bytes reported, got %d", size, received)
+	}
+	if calls == 0 {
+		t.Fatal("expected onReceive to be called at least once")
+	}
+}
+
 func TestCopyRemoteFileConcurrentCancellation(t *testing.T) {
 	size := int64(downloadChunkSize * 4)
 	data := make([]byte, size)
@@ -225,9 +252,36 @@ func TestCopyRemoteFileConcurrentCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // already cancelled
 
-	_, err := copyRemoteFileConcurrent(ctx, src, io.Discard, size)
+	_, err := copyRemoteFileConcurrent(ctx, src, io.Discard, size, nil)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+}
+
+func TestProgressTrackerThrottlesAndCounts(t *testing.T) {
+	var lastReceived int64
+	var updates int
+	pt := &progressTracker{
+		// 让首次 add 立即触发上报。
+		lastTime: time.Now().Add(-time.Second),
+		onUpdate: func(received int64, _ float64) {
+			lastReceived = received
+			updates++
+		},
+	}
+	pt.add(100)
+	if updates != 1 || lastReceived != 100 {
+		t.Fatalf("expected first add to report 100, got updates=%d received=%d", updates, lastReceived)
+	}
+	// 距上次上报不足 250ms，不应再次触发，但字节数应继续累计。
+	pt.add(50)
+	if updates != 1 {
+		t.Fatalf("expected update to be throttled, got %d updates", updates)
+	}
+	pt.lastTime = time.Now().Add(-time.Second)
+	pt.add(25)
+	if updates != 2 || lastReceived != 175 {
+		t.Fatalf("expected cumulative 175, got updates=%d received=%d", updates, lastReceived)
 	}
 }
 
