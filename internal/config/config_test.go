@@ -43,6 +43,83 @@ func TestNormalizeDefaultsAuthMode(t *testing.T) {
 	}
 }
 
+func TestNormalizeDefaultsProxyMode(t *testing.T) {
+	cfg := Config{}
+	got := cfg.Normalized()
+	if got.ProxyMode != ProxyModeNone {
+		t.Fatalf("expected default proxy mode %q, got %q", ProxyModeNone, got.ProxyMode)
+	}
+	if got.ProxyEnabled() {
+		t.Fatal("expected proxy to be disabled by default")
+	}
+}
+
+func TestValidateProxyRequiresHost(t *testing.T) {
+	cfg := Default()
+	cfg.Host = "example.com"
+	cfg.Username = "demo"
+	cfg.Password = "secret"
+	cfg.RemoteDir = "/incoming"
+	cfg.LocalDir = `C:\downloads`
+	cfg.ProxyMode = ProxyModeHTTP
+	cfg.ProxyPort = 8080
+
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected enabled proxy to require proxy host")
+	}
+}
+
+func TestValidateProxyRejectsInvalidMode(t *testing.T) {
+	cfg := Default()
+	cfg.Host = "example.com"
+	cfg.Username = "demo"
+	cfg.Password = "secret"
+	cfg.RemoteDir = "/incoming"
+	cfg.LocalDir = `C:\downloads`
+	cfg.ProxyMode = "ftp"
+
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected invalid proxy mode to fail validation")
+	}
+}
+
+func TestValidateProxyRejectsBadPort(t *testing.T) {
+	cfg := Default()
+	cfg.Host = "example.com"
+	cfg.Username = "demo"
+	cfg.Password = "secret"
+	cfg.RemoteDir = "/incoming"
+	cfg.LocalDir = `C:\downloads`
+	cfg.ProxyMode = ProxyModeSOCKS5
+	cfg.ProxyHost = "proxy.local"
+	cfg.ProxyPort = 0
+
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected proxy port 0 to fail validation")
+	}
+}
+
+func TestValidateProxySOCKS5WithAuth(t *testing.T) {
+	cfg := Default()
+	cfg.Host = "example.com"
+	cfg.Username = "demo"
+	cfg.Password = "secret"
+	cfg.RemoteDir = "/incoming"
+	cfg.LocalDir = `C:\downloads`
+	cfg.ProxyMode = ProxyModeSOCKS5
+	cfg.ProxyHost = "proxy.local"
+	cfg.ProxyPort = 1080
+	cfg.ProxyUsername = "user"
+	cfg.ProxyPassword = "pass"
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected valid socks5 proxy config, got %v", err)
+	}
+	if !cfg.Normalized().ProxyEnabled() {
+		t.Fatal("expected proxy to be enabled")
+	}
+}
+
 func TestStoreAddUpdateRemove(t *testing.T) {
 	s := &Store{}
 	cfg := Default()

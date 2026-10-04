@@ -22,6 +22,15 @@ const (
 	AuthModePrivateKey  = "private_key"
 )
 
+// 连接代理类型。ProxyModeNone 表示直连；HTTP/HTTPS 走 HTTP CONNECT 隧道，
+// SOCKS5 走 SOCKS5 协议，均支持可选的用户名+密码认证。
+const (
+	ProxyModeNone   = "none"
+	ProxyModeHTTP   = "http"
+	ProxyModeHTTPS  = "https"
+	ProxyModeSOCKS5 = "socks5"
+)
+
 // Config holds the settings of a single sync host. ID and Name identify the
 // host within the host manager store; the remaining fields drive the syncer.
 type Config struct {
@@ -39,6 +48,11 @@ type Config struct {
 	PollIntervalSeconds   int    `json:"pollIntervalSeconds"`
 	SkipHostKeyValidation bool   `json:"skipHostKeyValidation"`
 	KnownHostsPath        string `json:"knownHostsPath"`
+	ProxyMode             string `json:"proxyMode"`
+	ProxyHost             string `json:"proxyHost"`
+	ProxyPort             int    `json:"proxyPort"`
+	ProxyUsername         string `json:"proxyUsername"`
+	ProxyPassword         string `json:"proxyPassword"`
 }
 
 // DisplayName returns the user-visible label of the host: the configured
@@ -51,6 +65,11 @@ func (c Config) DisplayName() string {
 		return "未命名主机"
 	}
 	return fmt.Sprintf("%s:%d", c.Host, c.Port)
+}
+
+// ProxyEnabled reports whether the host connects through a proxy.
+func (c Config) ProxyEnabled() bool {
+	return c.ProxyMode != "" && c.ProxyMode != ProxyModeNone
 }
 
 func Default() Config {
@@ -101,6 +120,18 @@ func (c Config) Validate() error {
 			return fmt.Errorf("无法确定 known_hosts 路径: %w", err)
 		}
 	}
+	switch cfg.ProxyMode {
+	case ProxyModeNone:
+	case ProxyModeHTTP, ProxyModeHTTPS, ProxyModeSOCKS5:
+		if strings.TrimSpace(cfg.ProxyHost) == "" {
+			missing = append(missing, "代理服务器地址")
+		}
+		if cfg.ProxyPort <= 0 || cfg.ProxyPort > 65535 {
+			return fmt.Errorf("代理端口必须在 1 到 65535 之间")
+		}
+	default:
+		return fmt.Errorf("代理类型无效：%s", cfg.ProxyMode)
+	}
 	if len(missing) > 0 {
 		return fmt.Errorf("请填写完整配置：%s", strings.Join(missing, "、"))
 	}
@@ -134,6 +165,12 @@ func (c Config) Normalized() Config {
 	} else {
 		cfg.KnownHostsPath = ""
 	}
+	cfg.ProxyMode = strings.ToLower(strings.TrimSpace(cfg.ProxyMode))
+	if cfg.ProxyMode == "" {
+		cfg.ProxyMode = ProxyModeNone
+	}
+	cfg.ProxyHost = strings.TrimSpace(cfg.ProxyHost)
+	cfg.ProxyUsername = strings.TrimSpace(cfg.ProxyUsername)
 	if cfg.Port == 0 {
 		cfg.Port = defaultPort
 	}

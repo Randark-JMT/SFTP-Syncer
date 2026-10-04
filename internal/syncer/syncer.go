@@ -146,7 +146,7 @@ type poolWorker struct {
 	id        int
 	service   *Service
 	sshConfig *ssh.ClientConfig
-	addr      string
+	cfg       config.Config
 	conn      *ssh.Client
 	client    *sftp.Client
 	coolUntil time.Time
@@ -245,9 +245,13 @@ func (s *Service) RunOnce(ctx context.Context, cfg config.Config) (Result, error
 	}
 
 	addr := net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
-	s.initPool(ctx, sshConfig, addr)
-	s.logf("连接到 %s ...", addr)
-	conn, err := ssh.Dial("tcp", addr, sshConfig)
+	s.initPool(ctx, sshConfig, cfg)
+	if cfg.ProxyEnabled() {
+		s.logf("通过 %s 代理 %s 连接到 %s ...", strings.ToUpper(cfg.ProxyMode), proxyAddr(cfg), addr)
+	} else {
+		s.logf("连接到 %s ...", addr)
+	}
+	conn, err := dialSSH(cfg, sshConfig)
 	if err != nil {
 		return Result{}, fmt.Errorf("SSH 连接失败: %w", err)
 	}
@@ -410,7 +414,7 @@ func (s *Service) processDownloads(ctx context.Context, downloads []pendingDownl
 
 // initPool initialises the persistent worker pool on the first call; subsequent
 // calls are no-ops. Workers are bound to ctx so they stop when sync is cancelled.
-func (s *Service) initPool(ctx context.Context, sshConfig *ssh.ClientConfig, addr string) {
+func (s *Service) initPool(ctx context.Context, sshConfig *ssh.ClientConfig, cfg config.Config) {
 	if s.pool != nil {
 		return
 	}
@@ -421,7 +425,7 @@ func (s *Service) initPool(ctx context.Context, sshConfig *ssh.ClientConfig, add
 			id:        i,
 			service:   s,
 			sshConfig: sshConfig,
-			addr:      addr,
+			cfg:       cfg,
 		}
 		go w.run(ctx, queue)
 	}
@@ -464,7 +468,7 @@ func (w *poolWorker) connect() error {
 	}
 	w.disconnect()
 
-	conn, err := ssh.Dial("tcp", w.addr, w.sshConfig)
+	conn, err := dialSSH(w.cfg, w.sshConfig)
 	if err != nil {
 		return fmt.Errorf("SSH 连接失败: %w", err)
 	}

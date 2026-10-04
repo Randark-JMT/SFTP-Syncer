@@ -14,10 +14,29 @@ export interface HostConfig {
   pollIntervalSeconds: number;
   skipHostKeyValidation: boolean;
   knownHostsPath: string;
+  proxyMode: ProxyMode;
+  proxyHost: string;
+  proxyPort: number;
+  proxyUsername: string;
+  proxyPassword: string;
 }
 
 export const AUTH_PASSWORD = "password" as const;
 export const AUTH_PRIVATE_KEY = "private_key" as const;
+
+// 与 Go 侧 ProxyMode* 常量一致。
+export type ProxyMode = "none" | "http" | "https" | "socks5";
+export const PROXY_NONE = "none" as const;
+export const PROXY_HTTP = "http" as const;
+export const PROXY_HTTPS = "https" as const;
+export const PROXY_SOCKS5 = "socks5" as const;
+
+// 切换代理类型时的推荐默认端口。
+export const proxyDefaultPort: Record<Exclude<ProxyMode, "none">, number> = {
+  http: 8080,
+  https: 8443,
+  socks5: 1080,
+};
 
 // 与 Go 侧 Config.DisplayName 保持一致。
 export function hostDisplayName(host: HostConfig): string {
@@ -41,6 +60,11 @@ export function emptyHostConfig(): HostConfig {
     pollIntervalSeconds: 30,
     skipHostKeyValidation: true,
     knownHostsPath: "",
+    proxyMode: PROXY_NONE,
+    proxyHost: "",
+    proxyPort: 1080,
+    proxyUsername: "",
+    proxyPassword: "",
   };
 }
 

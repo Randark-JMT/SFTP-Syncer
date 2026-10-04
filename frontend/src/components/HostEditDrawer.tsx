@@ -6,6 +6,7 @@ import {
   Input,
   InputNumber,
   Radio,
+  Select,
   Space,
   Switch,
   Typography,
@@ -14,7 +15,15 @@ import {
 import { FolderOpenOutlined, FileOutlined } from "@ant-design/icons";
 import { api } from "../bindings";
 import { useAppStore } from "../store";
-import { emptyHostConfig, AUTH_PASSWORD, AUTH_PRIVATE_KEY, type HostConfig } from "../types";
+import {
+  emptyHostConfig,
+  proxyDefaultPort,
+  AUTH_PASSWORD,
+  AUTH_PRIVATE_KEY,
+  PROXY_NONE,
+  type HostConfig,
+  type ProxyMode,
+} from "../types";
 
 interface FormValues {
   name?: string;
@@ -30,6 +39,11 @@ interface FormValues {
   pollIntervalSeconds: number;
   skipHostKeyValidation: boolean;
   knownHostsPath: string;
+  proxyMode: ProxyMode;
+  proxyHost: string;
+  proxyPort: number;
+  proxyUsername: string;
+  proxyPassword: string;
 }
 
 function toFormValues(cfg: HostConfig): FormValues {
@@ -47,6 +61,11 @@ function toFormValues(cfg: HostConfig): FormValues {
     pollIntervalSeconds: cfg.pollIntervalSeconds,
     skipHostKeyValidation: cfg.skipHostKeyValidation,
     knownHostsPath: cfg.knownHostsPath,
+    proxyMode: cfg.proxyMode ?? PROXY_NONE,
+    proxyHost: cfg.proxyHost ?? "",
+    proxyPort: cfg.proxyPort ?? 1080,
+    proxyUsername: cfg.proxyUsername ?? "",
+    proxyPassword: cfg.proxyPassword ?? "",
   };
 }
 
@@ -73,6 +92,7 @@ export default function HostEditDrawer({
 
   const authMode = Form.useWatch("authMode", form) ?? AUTH_PASSWORD;
   const skipCheck = Form.useWatch("skipHostKeyValidation", form) ?? true;
+  const proxyMode = Form.useWatch("proxyMode", form) ?? PROXY_NONE;
 
   const handleOk = async () => {
     try {
@@ -248,6 +268,49 @@ export default function HostEditDrawer({
               }
             />
           </Form.Item>
+        )}
+
+        <Form.Item name="proxyMode" label="连接代理" extra="通过代理服务器连接 SFTP 主机">
+          <Select
+            options={[
+              { value: PROXY_NONE, label: "不使用代理" },
+              { value: "http", label: "HTTP" },
+              { value: "https", label: "HTTPS" },
+              { value: "socks5", label: "SOCKS5" },
+            ]}
+            onChange={(mode: ProxyMode) => {
+              if (mode !== PROXY_NONE) {
+                form.setFieldValue("proxyPort", proxyDefaultPort[mode]);
+              }
+            }}
+          />
+        </Form.Item>
+        {proxyMode !== PROXY_NONE && (
+          <>
+            <Space style={{ display: "flex" }} align="start">
+              <Form.Item
+                name="proxyHost"
+                label="代理服务器地址"
+                rules={[{ required: true, message: "请填写代理服务器地址" }]}
+                style={{ flex: 1, minWidth: 200 }}
+              >
+                <Input placeholder="proxy.example.com" />
+              </Form.Item>
+              <Form.Item
+                name="proxyPort"
+                label="端口"
+                rules={[{ required: true, message: " " }]}
+              >
+                <InputNumber min={1} max={65535} style={{ width: 96 }} />
+              </Form.Item>
+            </Space>
+            <Form.Item name="proxyUsername" label="代理用户名（可选）">
+              <Input autoComplete="off" />
+            </Form.Item>
+            <Form.Item name="proxyPassword" label="代理密码（可选）">
+              <Input.Password autoComplete="off" />
+            </Form.Item>
+          </>
         )}
 
         <Typography.Paragraph type="secondary" style={{ fontSize: 12 }}>
