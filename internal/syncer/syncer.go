@@ -28,8 +28,17 @@ const QuietPeriod = 30 * time.Minute
 const (
 	// maxDownloadWorkers 是单台主机允许配置的并发传输数上限。
 	maxDownloadWorkers = 10
-	workerCooldown     = 10 * time.Second
 )
+
+// workerRetryBackoff 是单个 Worker 在同一文件连续失败时的五级退避。
+// 达到 10 秒上限后仍失败，才结束当前文件并接收队列中的下一个任务。
+var workerRetryBackoff = [...]time.Duration{
+	time.Second,
+	2 * time.Second,
+	4 * time.Second,
+	8 * time.Second,
+	10 * time.Second,
+}
 
 const (
 	// keepaliveInterval / keepaliveTimeout 控制池化连接的 SSH keepalive：
@@ -47,7 +56,7 @@ const (
 
 	// downloadStallTimeout 是下载停滞看门狗的触发时长：TCP 层存活但服务器
 	// 不再发送数据时 keepalive 无法察觉，超过该时长没有任何字节到达即主动
-	// 中止传输，任务标记失败并交由下一轮轮询重试。
+	// 中止传输，随后由当前 Worker 按退避策略重试当前文件。
 	downloadStallTimeout = 2 * time.Minute
 )
 
@@ -141,7 +150,7 @@ type workerPool struct {
 }
 
 // poolWorker is a persistent goroutine that owns one SSH+SFTP connection.
-// On any failure it disconnects and enters a cooldown before accepting new tasks.
+// On failure it retries the current file with backoff before accepting new tasks.
 type poolWorker struct {
 	id        int
 	service   *Service
@@ -149,7 +158,6 @@ type poolWorker struct {
 	cfg       config.Config
 	conn      *ssh.Client
 	client    *sftp.Client
-	coolUntil time.Time
 
 	// lastUsed 是池化连接最近一次成功使用的时间，connect 据此决定复用前
 	// 是否需要探活。dead 由 keepalive 协程在对端失联时置位。stopKeepalive
@@ -444,15 +452,6 @@ func (w *poolWorker) run(ctx context.Context, queue <-chan workerTask) {
 	defer w.disconnect()
 
 	for {
-		if delay := time.Until(w.coolUntil); delay > 0 {
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(delay):
-				w.service.logf("Worker %d 冷却结束，恢复接收任务。", w.id+1)
-			}
-		}
-
 		select {
 		case <-ctx.Done():
 			return
@@ -574,10 +573,18 @@ func startSSHKeepalive(conn *ssh.Client, onDead func()) (stop func()) {
 	return func() { close(done) }
 }
 
-func (w *poolWorker) enterCooldown() {
-	w.coolUntil = time.Now().Add(workerCooldown)
-	w.service.logWarn("Worker %d 进入 %v 冷却。", w.id+1, workerCooldown)
+func (w *poolWorker) enterCooldown(ctx context.Context, delay time.Duration, retryLevel int) bool {
 	w.disconnect()
+	w.service.logWarn("Worker %d 冷却 %v 后重试当前文件（退避 %d/%d）。", w.id+1, delay, retryLevel, len(workerRetryBackoff))
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		w.service.logf("Worker %d 冷却结束，继续重试当前文件。", w.id+1)
+		return true
+	}
 }
 
 func (w *poolWorker) executeTask(ctx context.Context, task workerTask) {
@@ -595,30 +602,44 @@ func (w *poolWorker) executeTask(ctx context.Context, task workerTask) {
 		return
 	}
 
-	// 拨号/探活可能耗时数秒，先标记"连接中"，避免任务在尚未开始传输时就
-	// 显示"下载中"却长期零进度。
-	w.service.notifyProgress(ProgressEvent{RemotePath: dl.remotePath, State: ProgressStateConnecting, Total: dl.info.Size()})
-
-	if err := w.connect(); err != nil {
-		w.service.logError("Worker %d 连接失败，进入冷却（%s）: %v", w.id+1, dl.remotePath, err)
-		w.service.notifyProgress(ProgressEvent{RemotePath: dl.remotePath, State: ProgressStateFailed, Total: dl.info.Size()})
-		w.enterCooldown()
-		task.result <- downloadOutcome{}
-		return
-	}
-
-	w.service.notifyProgress(ProgressEvent{RemotePath: dl.remotePath, State: ProgressStateActive, Total: dl.info.Size()})
-
-	if err := w.service.downloadFile(ctx, w.client, dl.remotePath, dl.localPath, dl.info); err != nil {
-		if errors.Is(err, context.Canceled) {
+	// 拨号/探活或下载失败时保留当前任务，在同一 Worker 内进行五级退避重试；
+	// 这样不会把一个暂时断连的文件切碎到队列末尾等待下一轮同步。
+	var err error
+	for retryLevel := 0; ; retryLevel++ {
+		if ctx.Err() != nil {
 			task.result <- downloadOutcome{}
 			return
 		}
-		w.service.logError("Worker %d 下载失败，进入冷却（%s）: %v", w.id+1, dl.remotePath, err)
-		w.service.notifyProgress(ProgressEvent{RemotePath: dl.remotePath, State: ProgressStateFailed, Total: dl.info.Size()})
-		w.enterCooldown()
-		task.result <- downloadOutcome{}
-		return
+
+		w.service.notifyProgress(ProgressEvent{RemotePath: dl.remotePath, State: ProgressStateConnecting, Total: dl.info.Size()})
+		if err = w.connect(); err == nil {
+			w.service.notifyProgress(ProgressEvent{RemotePath: dl.remotePath, State: ProgressStateActive, Total: dl.info.Size()})
+			err = w.service.downloadFile(ctx, w.client, dl.remotePath, dl.localPath, dl.info)
+		}
+		if err == nil {
+			break
+		}
+		if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+			task.result <- downloadOutcome{}
+			return
+		}
+
+		if retryLevel == len(workerRetryBackoff) {
+			w.service.logError("Worker %d 当前文件连续重试 %d 级后仍失败（%s）: %v", w.id+1, len(workerRetryBackoff), dl.remotePath, err)
+			w.service.notifyProgress(ProgressEvent{RemotePath: dl.remotePath, State: ProgressStateFailed, Total: dl.info.Size()})
+			task.result <- downloadOutcome{}
+			return
+		}
+
+		if w.client == nil {
+			w.service.logWarn("Worker %d 连接失败（%s）: %v", w.id+1, dl.remotePath, err)
+		} else {
+			w.service.logWarn("Worker %d 下载失败（%s）: %v", w.id+1, dl.remotePath, err)
+		}
+		if !w.enterCooldown(ctx, workerRetryBackoff[retryLevel], retryLevel+1) {
+			task.result <- downloadOutcome{}
+			return
+		}
 	}
 
 	w.lastUsed = time.Now()
@@ -733,8 +754,8 @@ func (s *Service) downloadFile(ctx context.Context, client *sftp.Client, remoteP
 	s.logf("开始下载: %s -> %s (%d 字节)", remotePath, localPath, expectSize)
 
 	// 停滞看门狗：TCP 层存活但服务器不再发数据时 keepalive 无法察觉，这里
-	// 在长时间零字节后取消 stallCtx 中止传输，让任务快速失败并交由下一轮
-	// 轮询重试，而不是无限期挂起。
+	// 在长时间零字节后取消 stallCtx 中止传输，让当前 Worker 按退避策略重试，
+	// 而不是无限期挂起。
 	stallCtx, cancelStall := context.WithCancel(ctx)
 	defer cancelStall()
 

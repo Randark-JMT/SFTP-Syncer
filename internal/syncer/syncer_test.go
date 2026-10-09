@@ -13,6 +13,24 @@ import (
 	"time"
 )
 
+func TestWorkerRetryBackoffUsesFiveIncreasingDelays(t *testing.T) {
+	want := [...]time.Duration{
+		time.Second,
+		2 * time.Second,
+		4 * time.Second,
+		8 * time.Second,
+		10 * time.Second,
+	}
+	if len(workerRetryBackoff) != len(want) {
+		t.Fatalf("expected %d retry levels, got %d", len(want), len(workerRetryBackoff))
+	}
+	for i, delay := range want {
+		if workerRetryBackoff[i] != delay {
+			t.Errorf("retry level %d: expected %v, got %v", i+1, delay, workerRetryBackoff[i])
+		}
+	}
+}
+
 func TestEligibleForTransfer(t *testing.T) {
 	now := time.Date(2026, 5, 13, 12, 0, 0, 0, time.UTC)
 
