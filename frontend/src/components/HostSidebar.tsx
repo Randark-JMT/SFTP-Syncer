@@ -226,6 +226,9 @@ export default function HostSidebar({
               <Typography.Text type="secondary" style={{ fontSize: 12 }}>
                 轮询间隔：{host.pollIntervalSeconds} 秒
               </Typography.Text>
+              <Typography.Text type="secondary" style={{ fontSize: 12, marginLeft: 12 }}>
+                并发数：{host.concurrency ?? 3}
+              </Typography.Text>
             </Card>
           );
         })

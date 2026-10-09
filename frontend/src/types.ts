@@ -12,6 +12,7 @@ export interface HostConfig {
   remoteDir: string;
   localDir: string;
   pollIntervalSeconds: number;
+  concurrency: number;
   skipHostKeyValidation: boolean;
   knownHostsPath: string;
   proxyMode: ProxyMode;
@@ -58,6 +59,7 @@ export function emptyHostConfig(): HostConfig {
     remoteDir: "",
     localDir: "",
     pollIntervalSeconds: 30,
+    concurrency: 3,
     skipHostKeyValidation: true,
     knownHostsPath: "",
     proxyMode: PROXY_NONE,

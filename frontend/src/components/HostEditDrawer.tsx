@@ -37,6 +37,7 @@ interface FormValues {
   remoteDir: string;
   localDir: string;
   pollIntervalSeconds: number;
+  concurrency: number;
   skipHostKeyValidation: boolean;
   knownHostsPath: string;
   proxyMode: ProxyMode;
@@ -59,6 +60,7 @@ function toFormValues(cfg: HostConfig): FormValues {
     remoteDir: cfg.remoteDir,
     localDir: cfg.localDir,
     pollIntervalSeconds: cfg.pollIntervalSeconds,
+    concurrency: cfg.concurrency ?? 3,
     skipHostKeyValidation: cfg.skipHostKeyValidation,
     knownHostsPath: cfg.knownHostsPath,
     proxyMode: cfg.proxyMode ?? PROXY_NONE,
@@ -240,6 +242,14 @@ export default function HostEditDrawer({
           extra="相邻两轮扫描的间隔，范围 5–3600 秒"
         >
           <InputNumber min={5} max={3600} style={{ width: 160 }} />
+        </Form.Item>
+        <Form.Item
+          name="concurrency"
+          label="并发数"
+          rules={[{ required: true, type: "number", min: 1, max: 10, message: "并发数必须在 1 到 10 之间" }]}
+          extra="同时下载的文件数量，范围 1–10"
+        >
+          <InputNumber min={1} max={10} step={1} precision={0} style={{ width: 160 }} />
         </Form.Item>
 
         <Form.Item

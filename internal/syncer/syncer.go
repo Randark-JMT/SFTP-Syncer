@@ -26,8 +26,7 @@ import (
 const QuietPeriod = 30 * time.Minute
 
 const (
-	// maxDownloadWorkers 决定单台主机同时进行的文件传输数。FileZilla 默认
-	// 为 10 条并发传输，这里对齐以充分利用带宽。
+	// maxDownloadWorkers 是单台主机允许配置的并发传输数上限。
 	maxDownloadWorkers = 10
 	workerCooldown     = 10 * time.Second
 )
@@ -68,7 +67,7 @@ const (
 	downloadChunkSize = sftpMaxPacket
 	// downloadConcurrency 是单个文件允许的在途读块数上限。下载器使用滑动
 	// 窗口：读块按序写盘后才释放窗口槽位，单文件内存占用被严格限制在
-	// downloadConcurrency × downloadChunkSize（32 × 256KB = 8MB），10 个
+	// downloadConcurrency × downloadChunkSize（32 × 256KB = 8MB），最多 10 个
 	// Worker 同时下载约 80MB；旧实现 256 并发且乱序分块可无限堆积，10 个
 	// Worker 峰值可超过 1GB。8MB 在途窗口在 200ms RTT 下仍提供约 40MB/s
 	// 的单连接吞吐上限。
@@ -137,7 +136,8 @@ type workerTask struct {
 
 // workerPool holds the shared task queue consumed by poolWorkers.
 type workerPool struct {
-	queue chan workerTask
+	queue   chan workerTask
+	workers int
 }
 
 // poolWorker is a persistent goroutine that owns one SSH+SFTP connection.
@@ -383,7 +383,7 @@ func (s *Service) processDownloads(ctx context.Context, downloads []pendingDownl
 		})
 	}
 
-	s.logf("本轮待下载 %d 个文件，提交至 %d 个 Worker 队列。", len(downloads), maxDownloadWorkers)
+	s.logf("本轮待下载 %d 个文件，提交至 %d 个 Worker 队列。", len(downloads), s.pool.workers)
 
 	resultCh := make(chan downloadOutcome, len(downloads))
 	for _, dl := range downloads {
@@ -418,9 +418,17 @@ func (s *Service) initPool(ctx context.Context, sshConfig *ssh.ClientConfig, cfg
 	if s.pool != nil {
 		return
 	}
-	queue := make(chan workerTask, maxDownloadWorkers*256)
-	s.pool = &workerPool{queue: queue}
-	for i := range maxDownloadWorkers {
+	cfg = cfg.Normalized()
+	workerCount := cfg.Concurrency
+	if workerCount < 1 {
+		workerCount = 1
+	}
+	if workerCount > maxDownloadWorkers {
+		workerCount = maxDownloadWorkers
+	}
+	queue := make(chan workerTask, workerCount*256)
+	s.pool = &workerPool{queue: queue, workers: workerCount}
+	for i := range workerCount {
 		w := &poolWorker{
 			id:        i,
 			service:   s,
@@ -429,7 +437,7 @@ func (s *Service) initPool(ctx context.Context, sshConfig *ssh.ClientConfig, cfg
 		}
 		go w.run(ctx, queue)
 	}
-	s.logf("已启动 %d 个下载 Worker。", maxDownloadWorkers)
+	s.logf("已启动 %d 个下载 Worker。", workerCount)
 }
 
 func (w *poolWorker) run(ctx context.Context, queue <-chan workerTask) {

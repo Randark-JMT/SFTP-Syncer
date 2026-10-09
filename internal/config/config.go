@@ -18,6 +18,9 @@ const (
 	hostsFileName       = "hosts.json"
 	defaultPort         = 22
 	defaultPollInterval = 30
+	defaultConcurrency  = 3
+	minConcurrency      = 1
+	maxConcurrency      = 10
 	AuthModePassword    = "password"
 	AuthModePrivateKey  = "private_key"
 )
@@ -46,6 +49,7 @@ type Config struct {
 	RemoteDir             string `json:"remoteDir"`
 	LocalDir              string `json:"localDir"`
 	PollIntervalSeconds   int    `json:"pollIntervalSeconds"`
+	Concurrency           int    `json:"concurrency"`
 	SkipHostKeyValidation bool   `json:"skipHostKeyValidation"`
 	KnownHostsPath        string `json:"knownHostsPath"`
 	ProxyMode             string `json:"proxyMode"`
@@ -76,6 +80,7 @@ func Default() Config {
 	return Config{
 		Port:                  defaultPort,
 		PollIntervalSeconds:   defaultPollInterval,
+		Concurrency:           defaultConcurrency,
 		SkipHostKeyValidation: true,
 		AuthMode:              AuthModePassword,
 	}
@@ -114,6 +119,9 @@ func (c Config) Validate() error {
 	}
 	if cfg.PollIntervalSeconds < 5 {
 		return fmt.Errorf("轮询间隔不能小于 5 秒")
+	}
+	if cfg.Concurrency < minConcurrency || cfg.Concurrency > maxConcurrency {
+		return fmt.Errorf("并发数必须在 %d 到 %d 之间", minConcurrency, maxConcurrency)
 	}
 	if !cfg.SkipHostKeyValidation && strings.TrimSpace(cfg.KnownHostsPath) == "" {
 		if _, err := defaultKnownHostsPath(); err != nil {
@@ -176,6 +184,9 @@ func (c Config) Normalized() Config {
 	}
 	if cfg.PollIntervalSeconds == 0 {
 		cfg.PollIntervalSeconds = defaultPollInterval
+	}
+	if cfg.Concurrency == 0 {
+		cfg.Concurrency = defaultConcurrency
 	}
 	return cfg
 }

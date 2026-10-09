@@ -43,6 +43,36 @@ func TestNormalizeDefaultsAuthMode(t *testing.T) {
 	}
 }
 
+func TestNormalizeDefaultsConcurrency(t *testing.T) {
+	if got := (Config{}).Normalized().Concurrency; got != 3 {
+		t.Fatalf("expected default concurrency 3, got %d", got)
+	}
+}
+
+func TestValidateConcurrencyRange(t *testing.T) {
+	base := Default()
+	base.Host = "example.com"
+	base.Username = "demo"
+	base.Password = "secret"
+	base.RemoteDir = "/incoming"
+	base.LocalDir = `C:\downloads`
+
+	for _, concurrency := range []int{1, 10} {
+		cfg := base
+		cfg.Concurrency = concurrency
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("expected concurrency %d to be valid: %v", concurrency, err)
+		}
+	}
+	for _, concurrency := range []int{-1, 11} {
+		cfg := base
+		cfg.Concurrency = concurrency
+		if err := cfg.Validate(); err == nil {
+			t.Fatalf("expected concurrency %d to be rejected", concurrency)
+		}
+	}
+}
+
 func TestNormalizeDefaultsProxyMode(t *testing.T) {
 	cfg := Config{}
 	got := cfg.Normalized()
