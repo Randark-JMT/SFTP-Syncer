@@ -304,6 +304,59 @@ func TestProgressTrackerThrottlesAndCounts(t *testing.T) {
 	}
 }
 
+func TestProgressTrackerSamplesPeriodicallyAndZerosStaleSpeed(t *testing.T) {
+	updates := make(chan struct {
+		received int64
+		speed    float64
+	}, 8)
+	pt := &progressTracker{
+		lastTime: time.Now().Add(-time.Second),
+		onUpdate: func(received int64, speed float64) {
+			updates <- struct {
+				received int64
+				speed    float64
+			}{received: received, speed: speed}
+		},
+	}
+	pt.add(100)
+	first := <-updates
+	if first.received != 100 || first.speed <= 0 {
+		t.Fatalf("expected an initial positive-speed sample, got %+v", first)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := pt.start(ctx)
+	defer func() {
+		cancel()
+		pt.stop(done)
+	}()
+
+	select {
+	case periodic := <-updates:
+		if periodic.received != 100 {
+			t.Fatalf("expected periodic sample to retain cumulative bytes, got %+v", periodic)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expected a periodic update without another completed read chunk")
+	}
+
+	cancel()
+	pt.stop(done)
+	pt.report(time.Now().Add(progressStaleAfter + time.Second))
+	var final struct {
+		received int64
+		speed    float64
+	}
+	select {
+	case final = <-updates:
+	default:
+		t.Fatal("expected stale-speed update")
+	}
+	if final.received != 100 || final.speed != 0 {
+		t.Fatalf("expected unchanged bytes and zero speed after a quiet interval, got %+v", final)
+	}
+}
+
 // blockingReadAt 让偏移 0 处的读块阻塞，直到测试放行，用于验证滑动窗口对
 // 读超前的约束。
 type blockingReadAt struct {

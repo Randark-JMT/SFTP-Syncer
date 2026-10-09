@@ -67,7 +67,12 @@ const columns: ColumnsType<TaskEntry> = [
     title: "速度",
     dataIndex: "speedBps",
     width: 110,
-    render: (speed: number) => (speed >= 1 ? `${formatFileSize(speed)}/s` : "—"),
+    render: (_: number, row: TaskEntry) =>
+      row.speedBps >= 1
+        ? `${formatFileSize(row.speedBps)}/s`
+        : row.state === "active"
+          ? "0 B/s"
+          : "—",
   },
 ];
 

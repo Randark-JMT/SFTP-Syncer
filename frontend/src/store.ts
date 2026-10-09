@@ -43,9 +43,13 @@ function applyEvent(tasks: TaskEntry[], evt: ProgressEvent): TaskEntry[] {
     const next: TaskEntry = {
       ...cur,
       state: evt.state,
-      downloaded: evt.downloaded > 0 ? evt.downloaded : cur.downloaded,
+      // Progress events are snapshots. A retry starts from byte zero and a
+      // periodic sample may legitimately report zero bytes.
+      downloaded: evt.downloaded,
       total: evt.total > 0 ? evt.total : cur.total,
-      speedBps: evt.state === "failed" ? 0 : evt.speedBps > 0 ? evt.speedBps : cur.speedBps,
+      // Keep the backend's zero speed so stale values disappear when the
+      // transfer pauses or the watchdog detects a stall.
+      speedBps: evt.speedBps,
     };
     const copy = tasks.slice();
     copy[idx] = next;

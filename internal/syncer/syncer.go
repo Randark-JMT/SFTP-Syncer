@@ -81,6 +81,13 @@ const (
 	// Worker 峰值可超过 1GB。8MB 在途窗口在 200ms RTT 下仍提供约 40MB/s
 	// 的单连接吞吐上限。
 	downloadConcurrency = 32
+
+	// progressUpdateInterval controls how often the UI receives a progress
+	// sample. Sampling is independent of chunk completion so a quiet interval
+	// can publish zero speed instead of leaving a stale value on screen.
+	progressUpdateInterval = 250 * time.Millisecond
+	progressStaleAfter     = 750 * time.Millisecond
+	speedSmoothingAlpha    = 0.35
 )
 
 type Logger func(format string, args ...any)
@@ -772,6 +779,8 @@ func (s *Service) downloadFile(ctx context.Context, client *sftp.Client, remoteP
 		},
 	}
 	tracker.lastActivity.Store(time.Now().UnixNano())
+	trackerCtx, cancelTracker := context.WithCancel(stallCtx)
+	trackerDone := tracker.start(trackerCtx)
 
 	watchdogDone := make(chan struct{})
 	defer close(watchdogDone)
@@ -795,6 +804,11 @@ func (s *Service) downloadFile(ctx context.Context, client *sftp.Client, remoteP
 	}()
 
 	copied, copyErr := copyRemoteFile(stallCtx, remoteFile, localFile, expectSize, tracker.add)
+	cancelTracker()
+	tracker.stop(trackerDone)
+	// Flush the final sample before the task transitions to done. This keeps
+	// the last progress event accurate for consumers that retain task history.
+	tracker.report(time.Now())
 	closeErr := localFile.Close()
 	if copyErr != nil {
 		if errors.Is(copyErr, context.Canceled) && ctx.Err() == nil {
@@ -1092,10 +1106,14 @@ func copyWithContext(ctx context.Context, dst io.Writer, src io.Reader) (int64, 
 // 长时间停在 0 再猛跳，看起来像"卡住很久才开始"。onUpdate 最多每 250ms 触发
 // 一次。add 可被多个分块协程并发调用。
 type progressTracker struct {
+	// reportMu keeps callbacks in the same order as their sampled snapshots.
+	reportMu  sync.Mutex
 	mu        sync.Mutex
 	received  int64
 	lastBytes int64
 	lastTime  time.Time
+	lastByte  time.Time
+	speedBps  float64
 	onUpdate  func(received int64, speedBps float64)
 
 	// lastActivity 记录最近一次收到字节的时间（UnixNano），供停滞看门狗
@@ -1107,17 +1125,80 @@ func (pt *progressTracker) add(n int64) {
 	if n <= 0 {
 		return
 	}
-	pt.lastActivity.Store(time.Now().UnixNano())
-	pt.mu.Lock()
-	defer pt.mu.Unlock()
-	pt.received += n
 	now := time.Now()
-	if elapsed := now.Sub(pt.lastTime); elapsed >= 250*time.Millisecond {
-		delta := pt.received - pt.lastBytes
-		pt.onUpdate(pt.received, float64(delta)/elapsed.Seconds())
-		pt.lastBytes = pt.received
+	pt.lastActivity.Store(now.UnixNano())
+	pt.reportMu.Lock()
+	pt.mu.Lock()
+	pt.received += n
+	pt.lastByte = now
+	received, speed, shouldReport := pt.sampleLocked(now)
+	pt.mu.Unlock()
+	if shouldReport {
+		pt.onUpdate(received, speed)
+	}
+	pt.reportMu.Unlock()
+}
+
+// start runs a fixed-rate sampler so progress and speed updates do not depend
+// on when a 256 KiB read happens to complete. It also emits zero speed during
+// a quiet interval, allowing the UI to represent a stalled transfer honestly.
+func (pt *progressTracker) start(ctx context.Context) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(progressUpdateInterval)
+		defer ticker.Stop()
+		defer close(done)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case now := <-ticker.C:
+				pt.report(now)
+			}
+		}
+	}()
+	return done
+}
+
+func (pt *progressTracker) stop(done <-chan struct{}) {
+	<-done
+}
+
+func (pt *progressTracker) report(now time.Time) {
+	pt.reportMu.Lock()
+	defer pt.reportMu.Unlock()
+
+	pt.mu.Lock()
+	received, speed, shouldReport := pt.sampleLocked(now)
+	onUpdate := pt.onUpdate
+	pt.mu.Unlock()
+	if shouldReport && onUpdate != nil {
+		onUpdate(received, speed)
+	}
+}
+
+// sampleLocked updates the rate and sample baseline. pt.mu must be held.
+func (pt *progressTracker) sampleLocked(now time.Time) (int64, float64, bool) {
+	if pt.lastTime.IsZero() {
 		pt.lastTime = now
 	}
+	elapsed := now.Sub(pt.lastTime)
+	if elapsed <= 0 {
+		return pt.received, pt.speedBps, false
+	}
+	delta := pt.received - pt.lastBytes
+	rawSpeed := float64(delta) / elapsed.Seconds()
+	if pt.lastByte.IsZero() || now.Sub(pt.lastByte) > progressStaleAfter {
+		pt.speedBps = 0
+	} else if pt.speedBps == 0 {
+		pt.speedBps = rawSpeed
+	} else {
+		pt.speedBps = speedSmoothingAlpha*rawSpeed + (1-speedSmoothingAlpha)*pt.speedBps
+	}
+	received, speed := pt.received, pt.speedBps
+	pt.lastBytes = pt.received
+	pt.lastTime = now
+	return received, speed, true
 }
 
 // receiveWriter 把顺序拷贝路径的字节数桥接到 onReceive 回调。
